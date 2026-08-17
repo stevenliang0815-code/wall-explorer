@@ -1,4 +1,5 @@
 import { getRawDb } from "../../../db";
+import { getRequestExecutionContext } from "vinext/shims/request-context";
 import {
   auditBiasGuards,
   BACKFILL_POLICY,
@@ -29,6 +30,18 @@ type JobRow = {
 };
 
 type FailureRow = { id: number; market: HistoricalMarket; tradingDate: string };
+type RunnerRow = {
+  status: string;
+  leaseUntil: string | null;
+  lastStartedAt: string | null;
+  lastHeartbeatAt: string | null;
+  lastFinishedAt: string | null;
+  completedBatches: number;
+  completedUnits: number;
+  lastError: string | null;
+};
+
+const SERVER_BATCH = Object.freeze({ maxUnits: 12, maxRuntimeMs: 24_000, leaseMs: 45_000 });
 
 function taipeiYesterday() {
   return new Date(Date.now() + 8 * 60 * 60 * 1_000 - 86_400_000).toISOString().slice(0, 10);
@@ -54,6 +67,68 @@ async function latestJob() {
       started_at AS startedAt, updated_at AS updatedAt, completed_at AS completedAt
     FROM backfill_jobs ORDER BY id DESC LIMIT 1
   `).first<JobRow>();
+}
+
+async function runnerState() {
+  const d1 = await getRawDb();
+  return await d1.prepare(`
+    SELECT CASE WHEN status = 'running' AND lease_until < ? THEN 'stale' ELSE status END AS status,
+      lease_until AS leaseUntil, last_started_at AS lastStartedAt,
+      last_heartbeat_at AS lastHeartbeatAt, last_finished_at AS lastFinishedAt,
+      completed_batches AS completedBatches, completed_units AS completedUnits,
+      last_error AS lastError
+    FROM backfill_runner WHERE id = 1
+  `).bind(new Date().toISOString()).first<RunnerRow>();
+}
+
+async function ensureRunnerState() {
+  const d1 = await getRawDb();
+  await d1.prepare(`
+    INSERT OR IGNORE INTO backfill_runner (id, status, completed_batches, completed_units)
+    VALUES (1, 'idle', 0, 0)
+  `).run();
+}
+
+async function acquireRunnerLease(token: string) {
+  const d1 = await getRawDb();
+  await ensureRunnerState();
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const leaseUntil = new Date(now.getTime() + SERVER_BATCH.leaseMs).toISOString();
+  const result = await d1.prepare(`
+    UPDATE backfill_runner SET
+      status = 'running', lease_token = ?, lease_until = ?,
+      last_started_at = ?, last_heartbeat_at = ?, last_error = NULL
+    WHERE id = 1 AND (status != 'running' OR lease_until IS NULL OR lease_until < ?)
+  `).bind(token, leaseUntil, nowIso, nowIso, nowIso).run();
+  return (result.meta.changes ?? 0) > 0;
+}
+
+async function heartbeatRunner(token: string, completedUnits: number) {
+  const d1 = await getRawDb();
+  const now = new Date();
+  await d1.prepare(`
+    UPDATE backfill_runner SET
+      lease_until = ?, last_heartbeat_at = ?, completed_units = completed_units + ?
+    WHERE id = 1 AND lease_token = ?
+  `).bind(
+    new Date(now.getTime() + SERVER_BATCH.leaseMs).toISOString(),
+    now.toISOString(),
+    completedUnits,
+    token,
+  ).run();
+}
+
+async function releaseRunner(token: string, error: string | null) {
+  const d1 = await getRawDb();
+  const now = new Date().toISOString();
+  await d1.prepare(`
+    UPDATE backfill_runner SET
+      status = ?, lease_token = NULL, lease_until = NULL,
+      last_finished_at = ?, last_heartbeat_at = ?,
+      completed_batches = completed_batches + 1, last_error = ?
+    WHERE id = 1 AND lease_token = ?
+  `).bind(error ? "error" : "idle", now, now, error?.slice(0, 500) ?? null, token).run();
 }
 
 async function createJob() {
@@ -256,6 +331,33 @@ async function retryOneFailure(job: JobRow) {
   }
 }
 
+async function runServerBatch(maxUnits = SERVER_BATCH.maxUnits) {
+  const token = globalThis.crypto.randomUUID();
+  if (!(await acquireRunnerLease(token))) return;
+
+  const deadline = Date.now() + SERVER_BATCH.maxRuntimeMs;
+  let completedUnits = 0;
+  let batchError: string | null = null;
+  try {
+    while (completedUnits < maxUnits && Date.now() < deadline) {
+      let job = await latestJob();
+      if (!job) job = await createJob();
+      job = await alignJobWithPolicy(job);
+
+      if (job.status === "running") await runOneUnit(job);
+      else if (job.status === "complete_with_gaps") await retryOneFailure(job);
+      else break;
+
+      completedUnits += 1;
+      await heartbeatRunner(token, 1);
+    }
+  } catch (error) {
+    batchError = error instanceof Error ? error.message : "Unknown server runner error";
+  } finally {
+    await releaseRunner(token, batchError);
+  }
+}
+
 async function healthPayload() {
   const d1 = await getRawDb();
   const job = await latestJob();
@@ -266,13 +368,18 @@ async function healthPayload() {
       SUM(violations) AS violations
     FROM bias_audits GROUP BY audit_type
   `).all<{ auditType: string; passed: number; blocked: number; violations: number }>();
-  const openFailures = await d1.prepare("SELECT count(*) AS count FROM backfill_failures WHERE status = 'open'").first<{ count: number }>();
+  const [openFailures, runner] = await Promise.all([
+    d1.prepare("SELECT count(*) AS count FROM backfill_failures WHERE status = 'open'").first<{ count: number }>(),
+    runnerState(),
+  ]);
   return {
     status: job?.status ?? "not_started",
     job,
     progress: job ? Math.min(100, Number(((job.processedUnits / Math.max(job.totalUnits, 1)) * 100).toFixed(2))) : 0,
     audits: audits.results,
     openFailures: openFailures?.count ?? 0,
+    runner: runner ?? null,
+    serverBatch: SERVER_BATCH,
     policy: BACKFILL_POLICY,
   };
 }
@@ -281,18 +388,20 @@ export async function GET() {
   try {
     return Response.json(await healthPayload(), { headers: { "Cache-Control": "no-store" } });
   } catch {
-    return Response.json({ status: "unavailable", job: null, progress: 0, audits: [], openFailures: 0, policy: BACKFILL_POLICY }, { status: 503 });
+    return Response.json({ status: "unavailable", job: null, progress: 0, audits: [], openFailures: 0, runner: null, serverBatch: SERVER_BATCH, policy: BACKFILL_POLICY }, { status: 503 });
   }
 }
 
 export async function POST() {
   try {
-    let job = await latestJob();
-    if (!job) job = await createJob();
-    job = await alignJobWithPolicy(job);
-    if (job.status === "running") await runOneUnit(job);
-    else if (job.status === "complete_with_gaps") await retryOneFailure(job);
-    return Response.json(await healthPayload(), { headers: { "Cache-Control": "no-store" } });
+    const executionContext = getRequestExecutionContext();
+    if (executionContext) {
+      executionContext.waitUntil(runServerBatch());
+      return Response.json({ accepted: true, mode: "server_background", ...(await healthPayload()) }, { status: 202, headers: { "Cache-Control": "no-store" } });
+    }
+
+    await runServerBatch(1);
+    return Response.json({ accepted: true, mode: "server_foreground_fallback", ...(await healthPayload()) }, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     const message = error instanceof Error && error.message.startsWith("Official historical source")
       ? "官方歷史資料來源暫時無法取得"

@@ -241,6 +241,10 @@ a { color: inherit; }
 .backfill-auto strong { font-size: 10px; }
 .backfill-auto span { color: var(--muted); font-size: 8px; line-height: 1.45; }
 .backfill-auto .switch { flex: 0 0 46px; }
+.backfill-auto.runner-active { border-color: rgba(112,237,172,.28); background: rgba(112,237,172,.045); }
+.runner-pulse { flex: 0 0 11px; width: 11px; height: 11px; border-radius: 50%; background: rgba(143,158,151,.45); box-shadow: 0 0 0 6px rgba(143,158,151,.06); }
+.runner-active .runner-pulse { background: var(--mint); box-shadow: 0 0 0 6px rgba(112,237,172,.08), 0 0 16px rgba(112,237,172,.4); animation: runnerPulse 1.8s ease-in-out infinite; }
+@keyframes runnerPulse { 50% { transform: scale(.72); opacity: .55; } }
 .backfill-button { width: 100%; min-height: 45px; margin-top: 10px; border: 1px solid rgba(112,237,172,.28); border-radius: 13px; color: #041009; background: var(--mint); font-size: 10px; font-weight: 800; cursor: pointer; }
 .backfill-button:disabled { cursor: not-allowed; color: var(--muted); border-color: var(--line); background: rgba(255,255,255,.035); }
 .backfill-disclosure { margin: 10px 0 0; color: #b9aa89; font-size: 9px; line-height: 1.55; }

@@ -15,6 +15,13 @@
       "when": 1786987076169,
       "tag": "0001_lame_hammerhead",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1786988532333,
+      "tag": "0002_green_trish_tilby",
+      "breakpoints": true
     }
   ]
 }

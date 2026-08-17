@@ -10,11 +10,15 @@ type BackfillJob = {
   id: number; status: string; targetStart: string; targetEnd: string; cursorDate: string; cursorMarket: string;
   processedUnits: number; totalUnits: number; storedRows: number; emptyUnits: number; failedUnits: number; updatedAt: string;
 };
+type Runner = {
+  status: string; leaseUntil: string | null; lastStartedAt: string | null; lastHeartbeatAt: string | null;
+  lastFinishedAt: string | null; completedBatches: number; completedUnits: number; lastError: string | null;
+};
 
 export async function GET() {
   try {
     const [db, d1] = await Promise.all([getDb(), getRawDb()]);
-    const [summary, job, audits, failures, runs] = await Promise.all([
+    const [summary, job, audits, failures, runs, runner] = await Promise.all([
       d1.prepare(`
         SELECT count(*) AS historicalRows,
           count(distinct market || ':' || code) AS stockCount,
@@ -39,6 +43,14 @@ export async function GET() {
       `).all<{ auditType: string; passed: number; blocked: number; violations: number }>(),
       d1.prepare("SELECT count(*) AS count FROM backfill_failures WHERE status = 'open'").first<{ count: number }>(),
       db.select().from(modelRuns).orderBy(desc(modelRuns.createdAt)).limit(3),
+      d1.prepare(`
+        SELECT CASE WHEN status = 'running' AND lease_until < ? THEN 'stale' ELSE status END AS status,
+          lease_until AS leaseUntil, last_started_at AS lastStartedAt,
+          last_heartbeat_at AS lastHeartbeatAt, last_finished_at AS lastFinishedAt,
+          completed_batches AS completedBatches, completed_units AS completedUnits,
+          last_error AS lastError
+        FROM backfill_runner WHERE id = 1
+      `).bind(new Date().toISOString()).first<Runner>(),
     ]);
     const safeSummary = summary ?? { historicalRows: 0, stockCount: 0, earliestDate: null, latestDate: null };
     return Response.json({
@@ -51,12 +63,13 @@ export async function GET() {
         openFailures: failures?.count ?? 0,
         audits: audits.results,
       } : null,
+      runner: runner ?? null,
       policy: BACKFILL_POLICY,
     }, { headers: { "Cache-Control": "no-store" } });
   } catch {
     return Response.json({
       status: "not_started", historicalRows: 0, stockCount: 0, earliestDate: null, latestDate: null,
-      modelRuns: [], backfill: null, policy: BACKFILL_POLICY,
+      modelRuns: [], backfill: null, runner: null, policy: BACKFILL_POLICY,
     });
   }
 }

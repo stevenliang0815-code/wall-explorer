@@ -67,6 +67,19 @@ export const backfillJobs = sqliteTable("backfill_jobs", {
   completedAt: text("completed_at"),
 }, (table) => [index("backfill_jobs_status_time_idx").on(table.status, table.updatedAt)]);
 
+export const backfillRunner = sqliteTable("backfill_runner", {
+  id: integer("id").primaryKey(),
+  status: text("status").notNull().default("idle"),
+  leaseToken: text("lease_token"),
+  leaseUntil: text("lease_until"),
+  lastStartedAt: text("last_started_at"),
+  lastHeartbeatAt: text("last_heartbeat_at"),
+  lastFinishedAt: text("last_finished_at"),
+  completedBatches: integer("completed_batches").notNull().default(0),
+  completedUnits: integer("completed_units").notNull().default(0),
+  lastError: text("last_error"),
+});
+
 export const historicalObservations = sqliteTable("historical_observations", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   market: text("market").notNull(),
