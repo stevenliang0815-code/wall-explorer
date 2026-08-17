@@ -24,6 +24,28 @@ type Stock = {
   dataState: "official" | "directory_only";
   sourceUrl: string;
 };
+type DailyCandidate = Stock & {
+  changePercent: number;
+  ruleScore: number;
+  reasons: string[];
+  limitation: string;
+};
+type CandidateResponse = {
+  status: "official" | "unavailable";
+  layer: "v1_rule_engine";
+  tradingDate: string | null;
+  fetchedAt: string;
+  candidates: DailyCandidate[];
+  disclosure: string;
+};
+type ModelHealth = {
+  status: "collecting" | "not_started";
+  historicalRows: number;
+  stockCount: number;
+  earliestDate: string | null;
+  latestDate: string | null;
+  modelRuns: Array<{ horizon: number; status: string; sampleCount: number; calibrationError: number | null }>;
+};
 
 const navItems: { id: Tab; label: string; icon: string }[] = [
   { id: "overview", label: "總覽", icon: "⌂" },
@@ -76,6 +98,9 @@ export default function Home() {
   const [horizon, setHorizon] = useState<Horizon>(5);
   const [watchlist, setWatchlist] = useState<string[]>(["5274"]);
   const [reducedMotion, setReducedMotion] = useState(false);
+  const [candidateData, setCandidateData] = useState<CandidateResponse | null>(null);
+  const [candidateLoading, setCandidateLoading] = useState(true);
+  const [modelHealth, setModelHealth] = useState<ModelHealth>({ status: "not_started", historicalRows: 0, stockCount: 0, earliestDate: null, latestDate: null, modelRuns: [] });
   const ownerKey = useRef("");
 
   useEffect(() => {
@@ -84,6 +109,23 @@ export default function Home() {
       .then(setMarket)
       .catch(() => setMarket({ indexName: "發行量加權股價指數", close: null, change: null, changePercent: null, tradingDate: null, fetchedAt: new Date().toISOString(), status: "unavailable", sourceUrl: "https://openapi.twse.com.tw/" }))
       .finally(() => setMarketLoading(false));
+  }, []);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const response = await fetch("/api/candidates", { cache: "no-store" });
+        setCandidateData(await response.json() as CandidateResponse);
+      } catch {
+        setCandidateData({ status: "unavailable", layer: "v1_rule_engine", tradingDate: null, fetchedAt: new Date().toISOString(), candidates: [], disclosure: "官方資料不足，因此今日不產生候選。" });
+      } finally {
+        setCandidateLoading(false);
+        try {
+          const response = await fetch("/api/model-health", { cache: "no-store" });
+          setModelHealth(await response.json() as ModelHealth);
+        } catch { /* Keep the explicit zero state. */ }
+      }
+    })();
   }, []);
 
   useEffect(() => {
@@ -173,11 +215,11 @@ export default function Home() {
           <h1>{title}</h1><p>{subtitle}</p>
         </section>
 
-        {tab === "overview" && <Overview market={market} loading={marketLoading} query={query} setQuery={setQuery} onSearch={searchStocks} />}
+        {tab === "overview" && <Overview market={market} loading={marketLoading} query={query} setQuery={setQuery} onSearch={searchStocks} candidates={candidateData} candidateLoading={candidateLoading} health={modelHealth} onSelect={setSelectedStock} />}
         {tab === "market" && <MarketSearch query={query} setQuery={setQuery} onSearch={searchStocks} searching={searching} submitted={submittedQuery} stocks={stocks} onSelect={setSelectedStock} />}
         {tab === "events" && <Events />}
-        {tab === "explore" && <Explore />}
-        {tab === "rules" && <Rules horizon={horizon} setHorizon={setHorizon} />}
+        {tab === "explore" && <Explore candidates={candidateData} candidateLoading={candidateLoading} onSelect={setSelectedStock} />}
+        {tab === "rules" && <Rules horizon={horizon} setHorizon={setHorizon} health={modelHealth} />}
         {tab === "settings" && <Settings reducedMotion={reducedMotion} setReducedMotion={setReducedMotion} />}
       </main>
 
@@ -190,7 +232,7 @@ export default function Home() {
   );
 }
 
-function Overview({ market, loading, query, setQuery, onSearch }: { market: MarketPulse | null; loading: boolean; query: string; setQuery: (value: string) => void; onSearch: (event?: FormEvent) => void }) {
+function Overview({ market, loading, query, setQuery, onSearch, candidates, candidateLoading, health, onSelect }: { market: MarketPulse | null; loading: boolean; query: string; setQuery: (value: string) => void; onSearch: (event?: FormEvent) => void; candidates: CandidateResponse | null; candidateLoading: boolean; health: ModelHealth; onSelect: (stock: Stock) => void }) {
   const positive = (market?.change ?? 0) >= 0;
   return <div className="stack enter">
     <section className="truth-banner">
@@ -207,17 +249,33 @@ function Overview({ market, loading, query, setQuery, onSearch }: { market: Mark
       <div><span className="section-kicker">快速查詢</span><strong>想研究哪一家公司？</strong></div>
       <label className="search-field"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="輸入 5274 或信驊" inputMode="search" aria-label="股票代號或公司名稱" /><button type="submit">查詢</button></label>
     </form>
+    <CandidateBoard data={candidates} loading={candidateLoading} onSelect={onSelect} />
     <section className="section-block">
-      <div className="section-heading-row"><Heading eyebrow="研究管線" title="先證明能用，再顯示機率" /><span className="progress-count">1 / 4</span></div>
+      <div className="section-heading-row"><Heading eyebrow="研究管線" title="先證明能用，再顯示機率" /><span className="progress-count">{health.stockCount > 0 ? "2" : "1"} / 4</span></div>
       <div className="pipeline">
         <Pipe state="ok" title="官方資料入口" detail="上市指數與股票搜尋已接入" result="進行中" />
-        <Pipe state="work" title="長期資料回填" detail="價量、法人、營收與事件分層保存" result="建置中" />
+        <Pipe state={health.stockCount > 0 ? "ok" : "work"} title="每日全市場封存" detail={health.stockCount > 0 ? `${health.stockCount.toLocaleString("zh-TW")} 檔、${health.historicalRows.toLocaleString("zh-TW")} 筆已保存` : "官方日資料開始寫入長期資料庫"} result={health.stockCount > 0 ? "已啟動" : "建置中"} />
         <Pipe state="lock" title="樣本外回測" detail="5／10／20 日分開訓練與驗證" result="鎖定" />
         <Pipe state="lock" title="機率校準" detail="通過後才解鎖研究候選" result="鎖定" />
       </div>
     </section>
     <section className="schedule-strip"><Schedule time="08:00" title="事件雷達" detail="正式日程與公告" /><i /><Schedule time="09:00" title="開盤狀態" detail="僅顯示盤中狀態" /><i /><Schedule time="16:30" title="盤後掃描" detail="完整日資料研究" /></section>
   </div>;
+}
+
+function CandidateBoard({ data, loading, onSelect }: { data: CandidateResponse | null; loading: boolean; onSelect: (stock: Stock) => void }) {
+  return <section className="section-block candidate-board">
+    <div className="section-heading-row"><Heading eyebrow="第一版規則層" title="每日研究候選" /><span className="legacy-pill">V1 規則</span></div>
+    {loading ? <div className="candidate-loading"><i /><i /><i /></div> : data?.status === "official" && data.candidates.length ? <>
+      <div className="candidate-date">官方交易日 {data.tradingDate} · 最多顯示 5 檔</div>
+      <div className="candidate-list">{data.candidates.map((stock) => <button key={`${stock.market}-${stock.code}`} onClick={() => onSelect(stock)}>
+        <div className="candidate-rank"><span>{stock.ruleScore}</span><small>規則分</small></div>
+        <div className="candidate-name"><span>{stock.code} · {stock.market}</span><strong>{stock.name}</strong><small>{stock.reasons[0]}</small></div>
+        <div className="candidate-move"><strong className={stock.changePercent >= 0 ? "up" : "down"}>{stock.changePercent >= 0 ? "+" : ""}{stock.changePercent.toFixed(2)}%</strong><small>{number(stock.close)}</small></div>
+      </button>)}</div>
+    </> : <div className="empty-inline roomy"><strong>{data?.status === "official" ? "今天沒有股票通過第一版規則" : "官方資料不足，今日不產生候選"}</strong><span>不會用名稱索引或舊行情硬湊推薦。</span></div>}
+    <p className="candidate-disclosure">{data?.disclosure ?? "每日候選正在讀取官方資料。"}</p>
+  </section>;
 }
 
 function Pipe({ state, title, detail, result }: { state: "ok" | "work" | "lock"; title: string; detail: string; result: string }) {
@@ -255,8 +313,9 @@ function EventLevel({ kind, badge, title, detail }: { kind: string; badge: strin
   return <div><span className={`event-badge ${kind}`}>{badge}</span><strong>{title}</strong><p>{detail}</p></div>;
 }
 
-function Explore() {
+function Explore({ candidates, candidateLoading, onSelect }: { candidates: CandidateResponse | null; candidateLoading: boolean; onSelect: (stock: Stock) => void }) {
   return <div className="stack enter">
+    <CandidateBoard data={candidates} loading={candidateLoading} onSelect={onSelect} />
     <section className="locked-card"><div className="lock-orbit"><span>1</span></div><span className="section-kicker">第 1 次牆外探險</span><h2>還沒到出發時間</h2><p>長期資料、樣本外回測與機率校準尚未全部通過。系統不會為了湊候選而硬推股票。</p>
       <div className="gate-list"><Gate state="work" name="官方資料覆蓋" value="回填中" /><Gate state="lock" name="樣本外表現" value="未驗證" /><Gate state="lock" name="成本後結果" value="未驗證" /><Gate state="lock" name="機率校準" value="未驗證" /></div>
     </section><section className="note-card"><span>!</span><p><strong>系統只提出研究候選。</strong>不保證獲利、不自動下單；由你確認後才建立探險紀錄。</p></section>
@@ -264,12 +323,12 @@ function Explore() {
 }
 function Gate({ state, name, value }: { state: "work" | "lock"; name: string; value: string }) { return <div><Dot state={state} /><span>{name}</span><b>{value}</b></div>; }
 
-function Rules({ horizon, setHorizon }: { horizon: Horizon; setHorizon: (value: Horizon) => void }) {
+function Rules({ horizon, setHorizon, health }: { horizon: Horizon; setHorizon: (value: Horizon) => void; health: ModelHealth }) {
   const metrics = [["上漲機率", `未來 ${horizon} 日報酬大於 0 的校準機率`], ["超額報酬", "股票報酬減去對應市場指數報酬"], ["風險回落", "95% 風險情境的期間內可能回落"], ["不確定程度", "模型分歧、資料缺口與校準誤差"]];
   return <div className="stack enter">
     <section className="definition-card"><span className="section-kicker">核心界線</span><h2>官方證明現在，模型推論未來</h2><div className="definition-flow"><Definition no="01" title="官方事實" detail="價量、法人、營收、財報與事件" /><i>→</i><Definition no="02" title="模型推論" detail="學習歷史關係，輸出條件機率" /><i>→</i><Definition no="03" title="樣本外驗證" detail="未見資料、成本與機率校準" /></div></section>
     <section className="section-block"><Heading eyebrow="三個週期" title="每個期限獨立判斷" /><HorizonTabs horizon={horizon} setHorizon={setHorizon} /><div className="metric-grid">{metrics.map(([name, detail]) => <div className="metric-definition" key={name}><span>—</span><strong>{name}</strong><p>{detail}</p><small>等待驗證</small></div>)}</div></section>
-    <section className="section-block"><div className="section-heading-row"><Heading eyebrow="模型健康" title="能不能信，要看這裡" /><span className="health-pill">尚未評分</span></div><div className="health-list"><Health name="資料完整率" value="回填中" /><Health name="樣本外測試區間" value="尚未建立" /><Health name="交易成本後結果" value="尚未建立" /><Health name="機率校準誤差" value="尚未建立" /></div></section>
+    <section className="section-block"><div className="section-heading-row"><Heading eyebrow="模型健康" title="能不能信，要看這裡" /><span className="health-pill">{health.modelRuns.length ? "已有測試" : "尚未評分"}</span></div><div className="health-list"><Health name="已保存官方日資料" value={`${health.historicalRows.toLocaleString("zh-TW")} 筆`} /><Health name="已涵蓋股票" value={`${health.stockCount.toLocaleString("zh-TW")} 檔`} /><Health name="目前日期範圍" value={health.earliestDate && health.latestDate ? `${health.earliestDate}～${health.latestDate}` : "尚無資料"} /><Health name="樣本外回測" value={health.modelRuns.length ? `${health.modelRuns.length} 組紀錄` : "尚未執行"} /><Health name="機率校準" value={health.modelRuns.some((run) => run.calibrationError !== null) ? "已有結果" : "尚未執行"} /></div><p className="health-disclosure">這裡直接讀取資料庫紀錄；0 筆就是 0 筆，不使用假進度。</p></section>
   </div>;
 }
 function Definition({ no, title, detail }: { no: string; title: string; detail: string }) { return <div><span>{no}</span><strong>{title}</strong><p>{detail}</p></div>; }

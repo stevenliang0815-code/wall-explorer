@@ -105,6 +105,27 @@ a { color: inherit; }
 .status-dot.work { border: 2px solid var(--amber); box-shadow: 0 0 10px rgba(242,196,109,.18); }
 .status-dot.lock { border: 2px solid #3b5147; }
 
+.candidate-board { overflow: hidden; }
+.legacy-pill { color: var(--amber); border: 1px solid rgba(242,196,109,.22); background: rgba(242,196,109,.065); border-radius: 999px; padding: 6px 9px; font-size: 9px; font-weight: 800; white-space: nowrap; }
+.candidate-date { margin-top: 15px; color: var(--muted); font-size: 9px; }
+.candidate-list { display: grid; margin-top: 8px; border-top: 1px solid var(--line); }
+.candidate-list button { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 12px; min-height: 78px; padding: 12px 0; border: 0; border-bottom: 1px solid var(--line); background: transparent; text-align: left; cursor: pointer; }
+.candidate-list button:last-child { border-bottom: 0; }
+.candidate-list button:active { background: rgba(112,237,172,.035); }
+.candidate-rank { width: 45px; height: 45px; border: 1px solid rgba(112,237,172,.2); border-radius: 13px; display: grid; place-content: center; text-align: center; background: rgba(112,237,172,.055); }
+.candidate-rank span { color: var(--mint); font-size: 15px; font-weight: 800; line-height: 1; }
+.candidate-rank small { color: var(--muted); font-size: 7px; margin-top: 4px; }
+.candidate-name { display: grid; min-width: 0; gap: 3px; }
+.candidate-name > span { color: var(--muted); font-size: 8px; }
+.candidate-name strong { font-size: 13px; }
+.candidate-name small { overflow: hidden; color: var(--muted); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.candidate-move { display: grid; gap: 4px; text-align: right; }
+.candidate-move strong { font-size: 12px; }
+.candidate-move small { color: var(--muted); font-size: 9px; }
+.candidate-disclosure, .health-disclosure { margin: 12px 0 0; padding: 10px 11px; border-left: 2px solid var(--amber); color: #b9aa89; background: rgba(242,196,109,.045); font-size: 9px; line-height: 1.55; }
+.candidate-loading { display: grid; gap: 8px; margin-top: 16px; }
+.candidate-loading i { display: block; height: 58px; border-radius: 14px; background: linear-gradient(90deg, rgba(255,255,255,.025), rgba(255,255,255,.07), rgba(255,255,255,.025)); background-size: 200% 100%; animation: skeleton 1.3s infinite; }
+
 .schedule-strip { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: center; gap: 8px; padding: 18px 14px; border: 1px solid var(--line); border-radius: 21px; background: rgba(7,21,15,.72); }
 .schedule-strip div { text-align: center; display: grid; gap: 4px; }
 .schedule-strip div span { color: var(--amber); font-size: 10px; font-weight: 800; letter-spacing: .08em; }

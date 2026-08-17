@@ -5,7 +5,15 @@ export const TPEX_STOCK_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard
 type Row = Record<string, unknown>;
 export type NormalizedStock = {
   code: string; name: string; market: "上市" | "上櫃"; close: number | null;
-  change: number | null; volume: number | null; dataState: "official" | "directory_only"; sourceUrl: string;
+  change: number | null; volume: number | null; open?: number | null; high?: number | null;
+  low?: number | null; tradeValue?: number | null; dataState: "official" | "directory_only"; sourceUrl: string;
+};
+
+export type DailyCandidate = NormalizedStock & {
+  changePercent: number;
+  ruleScore: number;
+  reasons: string[];
+  limitation: string;
 };
 
 const directory: NormalizedStock[] = [
@@ -47,14 +55,23 @@ function twse(row: Row): NormalizedStock | null {
   const code = text(row, "Code", "證券代號", "股票代號");
   const name = text(row, "Name", "證券名稱", "股票名稱");
   if (!code || !name) return null;
-  return { code, name, market: "上市", close: numeric(text(row, "ClosingPrice", "收盤價")), change: numeric(text(row, "Change", "漲跌價差")), volume: numeric(text(row, "TradeVolume", "成交股數")), dataState: "official", sourceUrl: TWSE_STOCK_URL };
+  return { code, name, market: "上市", close: numeric(text(row, "ClosingPrice", "收盤價")), change: numeric(text(row, "Change", "漲跌價差")), volume: numeric(text(row, "TradeVolume", "成交股數")), open: numeric(text(row, "OpeningPrice", "開盤價")), high: numeric(text(row, "HighestPrice", "最高價")), low: numeric(text(row, "LowestPrice", "最低價")), tradeValue: numeric(text(row, "TradeValue", "成交金額")), dataState: "official", sourceUrl: TWSE_STOCK_URL };
 }
 
 function tpex(row: Row): NormalizedStock | null {
   const code = text(row, "SecuritiesCompanyCode", "Code", "證券代號", "股票代號");
   const name = text(row, "CompanyName", "Name", "證券名稱", "股票名稱");
   if (!code || !name) return null;
-  return { code, name, market: "上櫃", close: numeric(text(row, "Close", "ClosingPrice", "收盤價")), change: numeric(text(row, "Change", "漲跌價差")), volume: numeric(text(row, "TradingShares", "TradeVolume", "成交股數")), dataState: "official", sourceUrl: TPEX_STOCK_URL };
+  return { code, name, market: "上櫃", close: numeric(text(row, "Close", "ClosingPrice", "收盤價")), change: numeric(text(row, "Change", "漲跌價差")), volume: numeric(text(row, "TradingShares", "TradeVolume", "成交股數")), open: numeric(text(row, "Open", "OpeningPrice", "開盤價")), high: numeric(text(row, "High", "HighestPrice", "最高價")), low: numeric(text(row, "Low", "LowestPrice", "最低價")), tradeValue: numeric(text(row, "TransactionAmount", "TradeValue", "成交金額")), dataState: "official", sourceUrl: TPEX_STOCK_URL };
+}
+
+export async function fetchOfficialStocks() {
+  const results = await Promise.allSettled([officialJson(TWSE_STOCK_URL), officialJson(TPEX_STOCK_URL)]);
+  const normalized: NormalizedStock[] = [];
+  if (results[0].status === "fulfilled") for (const row of results[0].value) { const value = twse(row); if (value) normalized.push(value); }
+  if (results[1].status === "fulfilled") for (const row of results[1].value) { const value = tpex(row); if (value) normalized.push(value); }
+  if (!normalized.length) throw new Error("Official stock sources are unavailable");
+  return normalized;
 }
 
 export async function fetchMarketPulse() {
@@ -68,15 +85,40 @@ export async function fetchMarketPulse() {
 }
 
 export async function searchOfficialStocks(query: string) {
-  const results = await Promise.allSettled([officialJson(TWSE_STOCK_URL), officialJson(TPEX_STOCK_URL)]);
-  const normalized: NormalizedStock[] = [];
-  if (results[0].status === "fulfilled") for (const row of results[0].value) { const value = twse(row); if (value) normalized.push(value); }
-  if (results[1].status === "fulfilled") for (const row of results[1].value) { const value = tpex(row); if (value) normalized.push(value); }
+  let normalized: NormalizedStock[] = [];
+  try { normalized = await fetchOfficialStocks(); } catch { normalized = []; }
   const clean = query.trim().toLocaleLowerCase("zh-TW");
   const live = normalized.filter((item) => item.code.includes(clean) || item.name.toLocaleLowerCase("zh-TW").includes(clean));
   const liveCodes = new Set(live.map((item) => `${item.market}-${item.code}`));
   const fallback = directory.filter((item) => (item.code.includes(clean) || item.name.includes(clean)) && !liveCodes.has(`${item.market}-${item.code}`));
   return [...live, ...fallback].sort((a, b) => a.code.localeCompare(b.code)).slice(0, 30);
+}
+
+export async function fetchDailyCandidates(): Promise<DailyCandidate[]> {
+  const stocks = await fetchOfficialStocks();
+  return rankDailyCandidates(stocks);
+}
+
+export function rankDailyCandidates(stocks: NormalizedStock[]): DailyCandidate[] {
+  return stocks
+    .filter((stock) => /^\d{4}$/.test(stock.code) && stock.close !== null && stock.change !== null && stock.volume !== null)
+    .map((stock) => {
+      const previous = stock.close! - stock.change!;
+      const changePercent = previous > 0 ? stock.change! / previous * 100 : 0;
+      const liquidity = Math.max(0, Math.min(35, (Math.log10(Math.max(stock.volume!, 1)) - 4) / 4 * 35));
+      const momentum = Math.max(0, Math.min(35, changePercent / 5.5 * 35));
+      const heatControl = Math.max(0, 20 - Math.abs(changePercent - 2) * 4);
+      const ruleScore = Math.round(Math.max(0, Math.min(100, liquidity + momentum + heatControl + 10)));
+      const reasons = [
+        changePercent >= .5 && changePercent <= 4 ? "當日價格動能為正且未超過規則上限" : "當日價格動能通過最低條件",
+        stock.volume! >= 1_000_000 ? "成交量超過 100 萬股" : "成交量通過流動性門檻",
+        "代號與行情均由官方市場資料確認",
+      ];
+      return { ...stock, changePercent, ruleScore, reasons, limitation: "只使用當日價量的第一版規則；未使用歷史模型，不代表未來上漲機率。" };
+    })
+    .filter((stock) => stock.changePercent >= .5 && stock.changePercent <= 5.5 && stock.volume! >= 300_000 && stock.ruleScore >= 55)
+    .sort((a, b) => b.ruleScore - a.ruleScore || b.volume! - a.volume!)
+    .slice(0, 5);
 }
 
 function rocDateToIso(value: string) {
