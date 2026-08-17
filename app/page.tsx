@@ -39,12 +39,36 @@ type CandidateResponse = {
   disclosure: string;
 };
 type ModelHealth = {
-  status: "collecting" | "not_started";
+  status: string;
   historicalRows: number;
   stockCount: number;
   earliestDate: string | null;
   latestDate: string | null;
   modelRuns: Array<{ horizon: number; status: string; sampleCount: number; calibrationError: number | null }>;
+  backfill: null | {
+    id: number;
+    status: string;
+    targetStart: string;
+    targetEnd: string;
+    cursorDate: string;
+    cursorMarket: string;
+    processedUnits: number;
+    totalUnits: number;
+    storedRows: number;
+    emptyUnits: number;
+    failedUnits: number;
+    openFailures: number;
+    progress: number;
+    updatedAt: string;
+    audits: Array<{ auditType: string; passed: number; blocked: number; violations: number }>;
+  };
+  policy: { version: string; targetStart: string; universe: string; usesCurrentListings: boolean; featureAvailability: string };
+};
+
+const emptyHealth: ModelHealth = {
+  status: "not_started", historicalRows: 0, stockCount: 0, earliestDate: null, latestDate: null,
+  modelRuns: [], backfill: null,
+  policy: { version: "pit-v2.2", targetStart: "2018-01-01", universe: "official_full_market_as_of_each_date", usesCurrentListings: false, featureAvailability: "next_calendar_day_00_taipei" },
 };
 
 const navItems: { id: Tab; label: string; icon: string }[] = [
@@ -100,7 +124,9 @@ export default function Home() {
   const [reducedMotion, setReducedMotion] = useState(false);
   const [candidateData, setCandidateData] = useState<CandidateResponse | null>(null);
   const [candidateLoading, setCandidateLoading] = useState(true);
-  const [modelHealth, setModelHealth] = useState<ModelHealth>({ status: "not_started", historicalRows: 0, stockCount: 0, earliestDate: null, latestDate: null, modelRuns: [] });
+  const [modelHealth, setModelHealth] = useState<ModelHealth>(emptyHealth);
+  const [backfillWorking, setBackfillWorking] = useState(false);
+  const [backfillError, setBackfillError] = useState("");
   const ownerKey = useRef("");
 
   useEffect(() => {
@@ -121,6 +147,7 @@ export default function Home() {
       } finally {
         setCandidateLoading(false);
         try {
+          await fetch("/api/backfill", { method: "POST", cache: "no-store" });
           const response = await fetch("/api/model-health", { cache: "no-store" });
           setModelHealth(await response.json() as ModelHealth);
         } catch { /* Keep the explicit zero state. */ }
@@ -200,6 +227,25 @@ export default function Home() {
     window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
   }
 
+  async function runBackfill() {
+    if (backfillWorking) return;
+    setBackfillWorking(true);
+    setBackfillError("");
+    try {
+      const started = await fetch("/api/backfill", { method: "POST", cache: "no-store" });
+      if (!started.ok) {
+        const body = await started.json().catch(() => ({})) as { error?: string };
+        throw new Error(body.error ?? "回填服務暫時無法使用");
+      }
+      const response = await fetch("/api/model-health", { cache: "no-store" });
+      if (response.ok) setModelHealth(await response.json() as ModelHealth);
+    } catch (error) {
+      setBackfillError(error instanceof Error ? error.message : "回填服務暫時無法使用");
+    } finally {
+      setBackfillWorking(false);
+    }
+  }
+
   return (
     <div className="site-frame">
       <header className="topbar">
@@ -219,7 +265,7 @@ export default function Home() {
         {tab === "market" && <MarketSearch query={query} setQuery={setQuery} onSearch={searchStocks} searching={searching} submitted={submittedQuery} stocks={stocks} onSelect={setSelectedStock} />}
         {tab === "events" && <Events />}
         {tab === "explore" && <Explore candidates={candidateData} candidateLoading={candidateLoading} onSelect={setSelectedStock} />}
-        {tab === "rules" && <Rules horizon={horizon} setHorizon={setHorizon} health={modelHealth} />}
+        {tab === "rules" && <Rules horizon={horizon} setHorizon={setHorizon} health={modelHealth} backfillWorking={backfillWorking} backfillError={backfillError} onBackfill={runBackfill} />}
         {tab === "settings" && <Settings reducedMotion={reducedMotion} setReducedMotion={setReducedMotion} />}
       </main>
 
@@ -234,6 +280,7 @@ export default function Home() {
 
 function Overview({ market, loading, query, setQuery, onSearch, candidates, candidateLoading, health, onSelect }: { market: MarketPulse | null; loading: boolean; query: string; setQuery: (value: string) => void; onSearch: (event?: FormEvent) => void; candidates: CandidateResponse | null; candidateLoading: boolean; health: ModelHealth; onSelect: (stock: Stock) => void }) {
   const positive = (market?.change ?? 0) >= 0;
+  const backfill = health.backfill;
   return <div className="stack enter">
     <section className="truth-banner">
       <div className="truth-icon">✓</div><div><strong>第二版正在建立可信資料核心</strong><p>目前只顯示取得成功的官方資料；預測模型尚未通過驗證。</p></div><span className="version-pill">v2 · BUILD</span>
@@ -251,10 +298,10 @@ function Overview({ market, loading, query, setQuery, onSearch, candidates, cand
     </form>
     <CandidateBoard data={candidates} loading={candidateLoading} onSelect={onSelect} />
     <section className="section-block">
-      <div className="section-heading-row"><Heading eyebrow="研究管線" title="先證明能用，再顯示機率" /><span className="progress-count">{health.stockCount > 0 ? "2" : "1"} / 4</span></div>
+      <div className="section-heading-row"><Heading eyebrow="研究管線" title="先證明能用，再顯示機率" /><span className="progress-count">{health.historicalRows > 0 ? "2" : "1"} / 4</span></div>
       <div className="pipeline">
         <Pipe state="ok" title="官方資料入口" detail="上市指數與股票搜尋已接入" result="進行中" />
-        <Pipe state={health.stockCount > 0 ? "ok" : "work"} title="每日全市場封存" detail={health.stockCount > 0 ? `${health.stockCount.toLocaleString("zh-TW")} 檔、${health.historicalRows.toLocaleString("zh-TW")} 筆已保存` : "官方日資料開始寫入長期資料庫"} result={health.stockCount > 0 ? "已啟動" : "建置中"} />
+        <Pipe state={health.historicalRows > 0 ? "ok" : "work"} title="v2.2 歷史回填" detail={backfill ? `${backfill.progress.toFixed(2)}% · ${health.historicalRows.toLocaleString("zh-TW")} 筆 · 游標 ${backfill.cursorDate} ${backfill.cursorMarket}` : "逐日讀取當時的官方全市場母體"} result={backfill?.status === "blocked_bias_violation" ? "已阻擋" : health.historicalRows > 0 ? "回填中" : "準備中"} />
         <Pipe state="lock" title="樣本外回測" detail="5／10／20 日分開訓練與驗證" result="鎖定" />
         <Pipe state="lock" title="機率校準" detail="通過後才解鎖研究候選" result="鎖定" />
       </div>
@@ -323,12 +370,29 @@ function Explore({ candidates, candidateLoading, onSelect }: { candidates: Candi
 }
 function Gate({ state, name, value }: { state: "work" | "lock"; name: string; value: string }) { return <div><Dot state={state} /><span>{name}</span><b>{value}</b></div>; }
 
-function Rules({ horizon, setHorizon, health }: { horizon: Horizon; setHorizon: (value: Horizon) => void; health: ModelHealth }) {
+function Rules({ horizon, setHorizon, health, backfillWorking, backfillError, onBackfill }: { horizon: Horizon; setHorizon: (value: Horizon) => void; health: ModelHealth; backfillWorking: boolean; backfillError: string; onBackfill: () => void }) {
   const metrics = [["上漲機率", `未來 ${horizon} 日報酬大於 0 的校準機率`], ["超額報酬", "股票報酬減去對應市場指數報酬"], ["風險回落", "95% 風險情境的期間內可能回落"], ["不確定程度", "模型分歧、資料缺口與校準誤差"]];
+  const backfill = health.backfill;
+  const survivorship = backfill?.audits.find((audit) => audit.auditType === "survivorship");
+  const lookahead = backfill?.audits.find((audit) => audit.auditType === "lookahead");
+  const blocked = backfill?.status === "blocked_bias_violation";
+  const finished = backfill?.status === "complete";
   return <div className="stack enter">
     <section className="definition-card"><span className="section-kicker">核心界線</span><h2>官方證明現在，模型推論未來</h2><div className="definition-flow"><Definition no="01" title="官方事實" detail="價量、法人、營收、財報與事件" /><i>→</i><Definition no="02" title="模型推論" detail="學習歷史關係，輸出條件機率" /><i>→</i><Definition no="03" title="樣本外驗證" detail="未見資料、成本與機率校準" /></div></section>
+    <section className="section-block backfill-card">
+      <div className="section-heading-row"><Heading eyebrow="v2.2 · 歷史回填" title="先鎖死兩種偏差" /><span className={`health-pill ${blocked ? "danger" : ""}`}>{blocked ? "已阻擋" : finished ? "回填完成" : backfill ? "回填中" : "準備開始"}</span></div>
+      <p className="backfill-intro">回填範圍從 2018-01-01 起。每一天都重新讀取當日官方全市場表，不准拿現在仍上市櫃的公司名單倒推歷史。</p>
+      <div className="bias-guards">
+        <div><span className={survivorship?.blocked || survivorship?.violations ? "guard-bad" : "guard-ok"}>{survivorship?.blocked || survivorship?.violations ? "阻擋" : "硬規則"}</span><strong>1. 生存者偏差</strong><p>當日有出現在官方市場表的證券就保存；日後下市、下櫃也不刪除。現在的股票清單完全不參與歷史母體。</p><small>{survivorship ? `通過 ${survivorship.passed} 次 · 違規 ${survivorship.violations}` : "等待第一批官方資料稽核"}</small></div>
+        <div><span className={lookahead?.blocked || lookahead?.violations ? "guard-bad" : "guard-ok"}>{lookahead?.blocked || lookahead?.violations ? "阻擋" : "硬規則"}</span><strong>2. 前視偏見</strong><p>盤後資料最早到下一日 00:00（台北時間）才能當特徵；官方回傳日期和請求日期不一致時整批拒收。</p><small>{lookahead ? `通過 ${lookahead.passed} 次 · 違規 ${lookahead.violations}` : "等待第一批官方資料稽核"}</small></div>
+      </div>
+      <div className="backfill-progress"><div><span>實際回填進度</span><b>{backfill ? `${backfill.progress.toFixed(2)}%` : "0.00%"}</b></div><i><span style={{ width: `${backfill?.progress ?? 0}%` }} /></i><div className="backfill-meta"><span>{backfill ? `游標 ${backfill.cursorDate} · ${backfill.cursorMarket}` : "尚未建立工作"}</span><span>{backfill ? `${backfill.storedRows.toLocaleString("zh-TW")} 筆 · 缺口 ${backfill.openFailures}` : "0 筆"}</span></div></div>
+      <button className="backfill-button" onClick={onBackfill} disabled={backfillWorking || blocked || finished}>{backfillWorking ? "正在核對官方資料…" : blocked ? "偏差稽核未通過，已停止" : finished ? "本輪回填完成" : backfill?.status === "complete_with_gaps" ? "重試一個下載缺口" : backfill ? "繼續下一個市場日" : "開始 v2.2 回填"}</button>
+      {backfillError && <p className="backfill-error">本次沒有寫入：{backfillError}</p>}
+      <p className="backfill-disclosure">每次寫入前都先跑兩項稽核。下載失敗會登記成缺口，不會當成休市日，也不會假裝資料完整。</p>
+    </section>
     <section className="section-block"><Heading eyebrow="三個週期" title="每個期限獨立判斷" /><HorizonTabs horizon={horizon} setHorizon={setHorizon} /><div className="metric-grid">{metrics.map(([name, detail]) => <div className="metric-definition" key={name}><span>—</span><strong>{name}</strong><p>{detail}</p><small>等待驗證</small></div>)}</div></section>
-    <section className="section-block"><div className="section-heading-row"><Heading eyebrow="模型健康" title="能不能信，要看這裡" /><span className="health-pill">{health.modelRuns.length ? "已有測試" : "尚未評分"}</span></div><div className="health-list"><Health name="已保存官方日資料" value={`${health.historicalRows.toLocaleString("zh-TW")} 筆`} /><Health name="已涵蓋股票" value={`${health.stockCount.toLocaleString("zh-TW")} 檔`} /><Health name="目前日期範圍" value={health.earliestDate && health.latestDate ? `${health.earliestDate}～${health.latestDate}` : "尚無資料"} /><Health name="樣本外回測" value={health.modelRuns.length ? `${health.modelRuns.length} 組紀錄` : "尚未執行"} /><Health name="機率校準" value={health.modelRuns.some((run) => run.calibrationError !== null) ? "已有結果" : "尚未執行"} /></div><p className="health-disclosure">這裡直接讀取資料庫紀錄；0 筆就是 0 筆，不使用假進度。</p></section>
+    <section className="section-block"><div className="section-heading-row"><Heading eyebrow="模型健康" title="能不能信，要看這裡" /><span className="health-pill">{health.modelRuns.length ? "已有測試" : "尚未評分"}</span></div><div className="health-list"><Health name="已保存官方歷史資料" value={`${health.historicalRows.toLocaleString("zh-TW")} 筆`} /><Health name="歷史曾出現證券" value={`${health.stockCount.toLocaleString("zh-TW")} 檔`} /><Health name="目前日期範圍" value={health.earliestDate && health.latestDate ? `${health.earliestDate}～${health.latestDate}` : "尚無資料"} /><Health name="未修復下載缺口" value={`${backfill?.openFailures ?? 0} 個市場日`} /><Health name="樣本外回測" value={health.modelRuns.length ? `${health.modelRuns.length} 組紀錄` : "尚未執行"} /><Health name="機率校準" value={health.modelRuns.some((run) => run.calibrationError !== null) ? "已有結果" : "尚未執行"} /></div><p className="health-disclosure">這裡直接讀取資料庫紀錄；0 筆就是 0 筆，不使用假進度。</p></section>
   </div>;
 }
 function Definition({ no, title, detail }: { no: string; title: string; detail: string }) { return <div><span>{no}</span><strong>{title}</strong><p>{detail}</p></div>; }
@@ -337,7 +401,7 @@ function HorizonTabs({ horizon, setHorizon, compact = false }: { horizon: Horizo
 
 function Settings({ reducedMotion, setReducedMotion }: { reducedMotion: boolean; setReducedMotion: (value: boolean) => void }) {
   return <div className="stack enter">
-    <section className="version-card"><div><BrandMark /><span><small>目前版本</small><strong>第二版 · 建置中</strong></span></div><span className="version-pill">v2.0</span><p>第二版使用獨立專案，不會覆蓋第一版。完成驗收前，第一版保持原狀。</p></section>
+    <section className="version-card"><div><BrandMark /><span><small>目前版本</small><strong>第二版 · 歷史回填</strong></span></div><span className="version-pill">v2.2</span><p>第二版使用獨立專案，不會覆蓋第一版。v2.2 正在建立逐日、時間點一致的官方歷史資料庫。</p></section>
     <section className="section-block settings-block"><div className="setting-row"><div><strong>降低動畫</strong><span>裝置較慢時可減少轉場效果</span></div><button className={`switch ${reducedMotion ? "on" : ""}`} onClick={() => setReducedMotion(!reducedMotion)} role="switch" aria-checked={reducedMotion}><i /></button></div><div className="setting-row static"><div><strong>畫面方向</strong><span>直式優先，橫式仍可閱讀</span></div><b>直式</b></div><div className="setting-row static"><div><strong>研究模式</strong><span>不串接券商、不自動下單</span></div><b>已鎖定</b></div></section>
     <section className="section-block"><Heading eyebrow="官方來源" title="每筆資料都能往回查" /><div className="source-list">{sources.map(([short, name, detail, href]) => <a href={href} target="_blank" rel="noreferrer" key={short}><span>{short}</span><div><strong>{name}</strong><small>{detail}</small></div><b>↗</b></a>)}</div></section>
     <section className="note-card neutral"><span>i</span><p>這是研究工具，不是報明牌機器。沒有足夠證據時，答案就是「不知道」。</p></section>
