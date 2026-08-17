@@ -236,6 +236,11 @@ a { color: inherit; }
 .backfill-progress > i { display: block; height: 6px; margin: 10px 0; border-radius: 99px; overflow: hidden; background: rgba(112,237,172,.1); }
 .backfill-progress > i > span { display: block; height: 100%; min-width: 2px; border-radius: inherit; background: linear-gradient(90deg,#31d781,var(--mint-soft)); transition: width .3s ease; }
 .backfill-meta span { color: var(--muted-2); font-size: 8px; }
+.backfill-auto { min-height: 58px; margin-top: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 13px; display: flex; align-items: center; justify-content: space-between; gap: 14px; background: rgba(255,255,255,.018); }
+.backfill-auto > div { display: grid; gap: 4px; }
+.backfill-auto strong { font-size: 10px; }
+.backfill-auto span { color: var(--muted); font-size: 8px; line-height: 1.45; }
+.backfill-auto .switch { flex: 0 0 46px; }
 .backfill-button { width: 100%; min-height: 45px; margin-top: 10px; border: 1px solid rgba(112,237,172,.28); border-radius: 13px; color: #041009; background: var(--mint); font-size: 10px; font-weight: 800; cursor: pointer; }
 .backfill-button:disabled { cursor: not-allowed; color: var(--muted); border-color: var(--line); background: rgba(255,255,255,.035); }
 .backfill-disclosure { margin: 10px 0 0; color: #b9aa89; font-size: 9px; line-height: 1.55; }

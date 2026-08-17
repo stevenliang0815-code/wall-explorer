@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Tab = "overview" | "market" | "events" | "explore" | "rules" | "settings";
 type Horizon = 5 | 10 | 20;
@@ -127,6 +127,7 @@ export default function Home() {
   const [modelHealth, setModelHealth] = useState<ModelHealth>(emptyHealth);
   const [backfillWorking, setBackfillWorking] = useState(false);
   const [backfillError, setBackfillError] = useState("");
+  const [autoBackfill, setAutoBackfill] = useState(true);
   const ownerKey = useRef("");
 
   useEffect(() => {
@@ -227,7 +228,7 @@ export default function Home() {
     window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
   }
 
-  async function runBackfill() {
+  const runBackfill = useCallback(async () => {
     if (backfillWorking) return;
     setBackfillWorking(true);
     setBackfillError("");
@@ -244,7 +245,14 @@ export default function Home() {
     } finally {
       setBackfillWorking(false);
     }
-  }
+  }, [backfillWorking]);
+
+  useEffect(() => {
+    const status = modelHealth.backfill?.status ?? "not_started";
+    if (tab !== "rules" || !autoBackfill || backfillWorking || ["complete", "blocked_bias_violation"].includes(status)) return;
+    const timer = window.setTimeout(() => { void runBackfill(); }, 10_000);
+    return () => window.clearTimeout(timer);
+  }, [autoBackfill, backfillWorking, modelHealth.backfill?.processedUnits, modelHealth.backfill?.status, runBackfill, tab]);
 
   return (
     <div className="site-frame">
@@ -265,7 +273,7 @@ export default function Home() {
         {tab === "market" && <MarketSearch query={query} setQuery={setQuery} onSearch={searchStocks} searching={searching} submitted={submittedQuery} stocks={stocks} onSelect={setSelectedStock} />}
         {tab === "events" && <Events />}
         {tab === "explore" && <Explore candidates={candidateData} candidateLoading={candidateLoading} onSelect={setSelectedStock} />}
-        {tab === "rules" && <Rules horizon={horizon} setHorizon={setHorizon} health={modelHealth} backfillWorking={backfillWorking} backfillError={backfillError} onBackfill={runBackfill} />}
+        {tab === "rules" && <Rules horizon={horizon} setHorizon={setHorizon} health={modelHealth} backfillWorking={backfillWorking} backfillError={backfillError} autoBackfill={autoBackfill} setAutoBackfill={setAutoBackfill} onBackfill={runBackfill} />}
         {tab === "settings" && <Settings reducedMotion={reducedMotion} setReducedMotion={setReducedMotion} />}
       </main>
 
@@ -370,7 +378,7 @@ function Explore({ candidates, candidateLoading, onSelect }: { candidates: Candi
 }
 function Gate({ state, name, value }: { state: "work" | "lock"; name: string; value: string }) { return <div><Dot state={state} /><span>{name}</span><b>{value}</b></div>; }
 
-function Rules({ horizon, setHorizon, health, backfillWorking, backfillError, onBackfill }: { horizon: Horizon; setHorizon: (value: Horizon) => void; health: ModelHealth; backfillWorking: boolean; backfillError: string; onBackfill: () => void }) {
+function Rules({ horizon, setHorizon, health, backfillWorking, backfillError, autoBackfill, setAutoBackfill, onBackfill }: { horizon: Horizon; setHorizon: (value: Horizon) => void; health: ModelHealth; backfillWorking: boolean; backfillError: string; autoBackfill: boolean; setAutoBackfill: (value: boolean) => void; onBackfill: () => void }) {
   const metrics = [["上漲機率", `未來 ${horizon} 日報酬大於 0 的校準機率`], ["超額報酬", "股票報酬減去對應市場指數報酬"], ["風險回落", "95% 風險情境的期間內可能回落"], ["不確定程度", "模型分歧、資料缺口與校準誤差"]];
   const backfill = health.backfill;
   const survivorship = backfill?.audits.find((audit) => audit.auditType === "survivorship");
@@ -387,6 +395,7 @@ function Rules({ horizon, setHorizon, health, backfillWorking, backfillError, on
         <div><span className={lookahead?.blocked || lookahead?.violations ? "guard-bad" : "guard-ok"}>{lookahead?.blocked || lookahead?.violations ? "阻擋" : "硬規則"}</span><strong>2. 前視偏見</strong><p>盤後資料最早到下一日 00:00（台北時間）才能當特徵；官方回傳日期和請求日期不一致時整批拒收。</p><small>{lookahead ? `通過 ${lookahead.passed} 次 · 違規 ${lookahead.violations}` : "等待第一批官方資料稽核"}</small></div>
       </div>
       <div className="backfill-progress"><div><span>實際回填進度</span><b>{backfill ? `${backfill.progress.toFixed(2)}%` : "0.00%"}</b></div><i><span style={{ width: `${backfill?.progress ?? 0}%` }} /></i><div className="backfill-meta"><span>{backfill ? `游標 ${backfill.cursorDate} · ${backfill.cursorMarket}` : "尚未建立工作"}</span><span>{backfill ? `${backfill.storedRows.toLocaleString("zh-TW")} 筆 · 缺口 ${backfill.openFailures}` : "0 筆"}</span></div></div>
+      <div className="backfill-auto"><div><strong>本頁持續回填</strong><span>停留在「規則」頁時，每 10 秒安全推進一個市場日</span></div><button className={`switch ${autoBackfill ? "on" : ""}`} onClick={() => setAutoBackfill(!autoBackfill)} role="switch" aria-checked={autoBackfill} aria-label="本頁持續回填"><i /></button></div>
       <button className="backfill-button" onClick={onBackfill} disabled={backfillWorking || blocked || finished}>{backfillWorking ? "正在核對官方資料…" : blocked ? "偏差稽核未通過，已停止" : finished ? "本輪回填完成" : backfill?.status === "complete_with_gaps" ? "重試一個下載缺口" : backfill ? "繼續下一個市場日" : "開始 v2.2 回填"}</button>
       {backfillError && <p className="backfill-error">本次沒有寫入：{backfillError}</p>}
       <p className="backfill-disclosure">每次寫入前都先跑兩項稽核。下載失敗會登記成缺口，不會當成休市日，也不會假裝資料完整。</p>
