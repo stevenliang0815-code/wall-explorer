@@ -73,6 +73,22 @@ async function createJob() {
   return job;
 }
 
+async function alignJobWithPolicy(job: JobRow) {
+  if (job.targetStart <= BACKFILL_POLICY.targetStart) return job;
+  const d1 = await getRawDb();
+  const additionalUnits = calendarDays(BACKFILL_POLICY.targetStart, dayBefore(job.targetStart)) * 2;
+  await d1.prepare(`
+    UPDATE backfill_jobs SET
+      target_start = ?,
+      total_units = total_units + ?,
+      status = 'running',
+      completed_at = NULL,
+      updated_at = ?
+    WHERE id = ?
+  `).bind(BACKFILL_POLICY.targetStart, additionalUnits, new Date().toISOString(), job.id).run();
+  return await latestJob() ?? job;
+}
+
 function nextCursor(job: JobRow) {
   if (job.cursorMarket === "上市") return { date: job.cursorDate, market: "上櫃" as const };
   return { date: dayBefore(job.cursorDate), market: "上市" as const };
@@ -273,6 +289,7 @@ export async function POST() {
   try {
     let job = await latestJob();
     if (!job) job = await createJob();
+    job = await alignJobWithPolicy(job);
     if (job.status === "running") await runOneUnit(job);
     else if (job.status === "complete_with_gaps") await retryOneFailure(job);
     return Response.json(await healthPayload(), { headers: { "Cache-Control": "no-store" } });

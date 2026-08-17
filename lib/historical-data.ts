@@ -33,7 +33,7 @@ type OfficialReport = {
 
 export const BACKFILL_POLICY = Object.freeze({
   version: "pit-v2.2",
-  targetStart: "2018-01-01",
+  targetStart: "2010-01-04",
   universe: "official_full_market_as_of_each_date",
   usesCurrentListings: false,
   featureAvailability: "next_calendar_day_00_taipei",

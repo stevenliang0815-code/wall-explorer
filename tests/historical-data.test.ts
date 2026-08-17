@@ -19,6 +19,7 @@ test("point-in-time parser retains securities without consulting today's listing
 
   const rows = parseHistoricalReport(report, "上市", "2020-01-02", "https://official.example/day");
   assert.equal(BACKFILL_POLICY.usesCurrentListings, false);
+  assert.equal(BACKFILL_POLICY.targetStart, "2010-01-04");
   assert.deepEqual(rows.map((row) => row.code), ["1101", "1234", "0050"]);
   assert.equal(rows[1].change, -2);
   assert.equal(rows[1].usableFrom, "2020-01-03T00:00:00+08:00");
@@ -37,4 +38,3 @@ test("look-ahead audit blocks same-day feature availability", () => {
   assert.equal(audit.lookAhead.status, "blocked");
   assert.equal(audit.lookAhead.violations, 1);
 });
-

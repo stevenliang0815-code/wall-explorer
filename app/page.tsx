@@ -68,7 +68,7 @@ type ModelHealth = {
 const emptyHealth: ModelHealth = {
   status: "not_started", historicalRows: 0, stockCount: 0, earliestDate: null, latestDate: null,
   modelRuns: [], backfill: null,
-  policy: { version: "pit-v2.2", targetStart: "2018-01-01", universe: "official_full_market_as_of_each_date", usesCurrentListings: false, featureAvailability: "next_calendar_day_00_taipei" },
+  policy: { version: "pit-v2.2", targetStart: "2010-01-04", universe: "official_full_market_as_of_each_date", usesCurrentListings: false, featureAvailability: "next_calendar_day_00_taipei" },
 };
 
 const navItems: { id: Tab; label: string; icon: string }[] = [
@@ -381,7 +381,7 @@ function Rules({ horizon, setHorizon, health, backfillWorking, backfillError, on
     <section className="definition-card"><span className="section-kicker">核心界線</span><h2>官方證明現在，模型推論未來</h2><div className="definition-flow"><Definition no="01" title="官方事實" detail="價量、法人、營收、財報與事件" /><i>→</i><Definition no="02" title="模型推論" detail="學習歷史關係，輸出條件機率" /><i>→</i><Definition no="03" title="樣本外驗證" detail="未見資料、成本與機率校準" /></div></section>
     <section className="section-block backfill-card">
       <div className="section-heading-row"><Heading eyebrow="v2.2 · 歷史回填" title="先鎖死兩種偏差" /><span className={`health-pill ${blocked ? "danger" : ""}`}>{blocked ? "已阻擋" : finished ? "回填完成" : backfill ? "回填中" : "準備開始"}</span></div>
-      <p className="backfill-intro">回填範圍從 2018-01-01 起。每一天都重新讀取當日官方全市場表，不准拿現在仍上市櫃的公司名單倒推歷史。</p>
+      <p className="backfill-intro">第一輪回填範圍從 2010-01-04 起。每一天都重新讀取當日官方全市場表，不准拿現在仍上市櫃的公司名單倒推歷史。</p>
       <div className="bias-guards">
         <div><span className={survivorship?.blocked || survivorship?.violations ? "guard-bad" : "guard-ok"}>{survivorship?.blocked || survivorship?.violations ? "阻擋" : "硬規則"}</span><strong>1. 生存者偏差</strong><p>當日有出現在官方市場表的證券就保存；日後下市、下櫃也不刪除。現在的股票清單完全不參與歷史母體。</p><small>{survivorship ? `通過 ${survivorship.passed} 次 · 違規 ${survivorship.violations}` : "等待第一批官方資料稽核"}</small></div>
         <div><span className={lookahead?.blocked || lookahead?.violations ? "guard-bad" : "guard-ok"}>{lookahead?.blocked || lookahead?.violations ? "阻擋" : "硬規則"}</span><strong>2. 前視偏見</strong><p>盤後資料最早到下一日 00:00（台北時間）才能當特徵；官方回傳日期和請求日期不一致時整批拒收。</p><small>{lookahead ? `通過 ${lookahead.passed} 次 · 違規 ${lookahead.violations}` : "等待第一批官方資料稽核"}</small></div>
