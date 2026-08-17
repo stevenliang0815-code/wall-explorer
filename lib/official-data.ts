@@ -36,7 +36,7 @@ export function numeric(value: unknown): number | null {
 }
 
 async function officialJson(url: string): Promise<Row[]> {
-  const response = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "WallExplorerV2/2.0" }, signal: AbortSignal.timeout(8000), cache: "no-store" });
+  const response = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "WallExplorerV2/2.0" }, signal: AbortSignal.timeout(3500), cache: "no-store" });
   if (!response.ok) throw new Error(`Official source returned ${response.status}`);
   const body = await response.json();
   if (!Array.isArray(body)) throw new Error("Official source returned an unexpected shape");

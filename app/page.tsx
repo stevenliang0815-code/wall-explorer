@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type Tab = "overview" | "market" | "events" | "explore" | "rules" | "settings";
 type Horizon = 5 | 10 | 20;
@@ -76,6 +76,7 @@ export default function Home() {
   const [horizon, setHorizon] = useState<Horizon>(5);
   const [watchlist, setWatchlist] = useState<string[]>(["5274"]);
   const [reducedMotion, setReducedMotion] = useState(false);
+  const ownerKey = useRef("");
 
   useEffect(() => {
     fetch("/api/market", { cache: "no-store" })
@@ -87,6 +88,22 @@ export default function Home() {
 
   useEffect(() => {
     if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => undefined);
+    void (async () => {
+      let key = window.localStorage.getItem("wall-explorer-device-key");
+      if (!key) {
+        key = globalThis.crypto?.randomUUID?.() ?? `device-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        window.localStorage.setItem("wall-explorer-device-key", key);
+      }
+      ownerKey.current = key;
+      try {
+        const response = await fetch(`/api/watchlist?owner=${encodeURIComponent(key)}`, { cache: "no-store" });
+        const body = (await response.json()) as { codes?: string[] };
+        if (body.codes?.length) setWatchlist(body.codes);
+      } catch {
+        const local = window.localStorage.getItem("wall-explorer-watchlist");
+        if (local) setWatchlist(JSON.parse(local) as string[]);
+      }
+    })();
   }, []);
 
   useEffect(() => {
@@ -124,7 +141,16 @@ export default function Home() {
   }
 
   function toggleWatchlist(code: string) {
-    setWatchlist((current) => current.includes(code) ? current.filter((item) => item !== code) : [...current, code]);
+    const removing = watchlist.includes(code);
+    const next = removing ? watchlist.filter((item) => item !== code) : [...watchlist, code];
+    setWatchlist(next);
+    window.localStorage.setItem("wall-explorer-watchlist", JSON.stringify(next));
+    if (!ownerKey.current) return;
+    void fetch("/api/watchlist", {
+      method: removing ? "DELETE" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ owner: ownerKey.current, code, market: selectedStock?.market ?? "" }),
+    }).catch(() => undefined);
   }
 
   function go(next: Tab) {
