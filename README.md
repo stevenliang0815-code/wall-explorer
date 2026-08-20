@@ -98,6 +98,53 @@ actions tied to the current ChatGPT user. Leave public content anonymous.
 - `npm run validate:artifact`: recheck an existing artifact's manifest and ESM `default.fetch` export
 - `npm run db:generate`: generate Drizzle migrations after schema changes
 
+## Historical Snapshot Pipeline
+
+The long historical rebuild is deliberately independent of the browser and the
+Web App runtime. A persistent server or CI runner owns the official-market
+downloads, SQLite transactions, checkpoints, validation, and release artifact.
+Closing the Web App therefore cannot stop the rebuild.
+
+1. Build or resume the complete historical database on a server:
+
+   ```bash
+   npm run snapshot:build -- --start 2010-01-04 --end 2026-08-19 --output ./snapshot-output
+   ```
+
+   The command preserves `builder.sqlite` and `builder_checkpoints`, fetches one
+   complete TWSE and TPEx market table per trading date, and publishes a release
+   only after duplicate, survivorship, date-scope, and look-ahead audits pass.
+   A successful release contains `historical.sqlite.gz`, compressed Web-import
+   chunks, and `manifest.json` with SHA-256 checksums.
+
+2. Publish the release directory to durable HTTPS object storage and set
+   `HISTORICAL_SNAPSHOT_MANIFEST_URL` in the Web App environment to the public
+   `manifest.json` URL.
+
+3. Import it into the Web App database from an independent server job:
+
+   ```bash
+   WALL_EXPLORER_URL=https://wall-explorer-v2.stbue7857.chatgpt.site \
+   OAI_SITES_AUTHORIZATION=... npm run snapshot:bootstrap
+   ```
+
+   The importer verifies every checksum and checkpoints each chunk. Existing
+   observations are preserved and updated with an idempotent unique key; a
+   restart resumes at the next incomplete chunk.
+
+4. After the snapshot is complete, schedule the daily incremental runner after
+   the Taiwan market close:
+
+   ```bash
+   WALL_EXPLORER_URL=https://wall-explorer-v2.stbue7857.chatgpt.site \
+   OAI_SITES_AUTHORIZATION=... npm run incremental:run
+   ```
+
+The Worker weekday trigger is only an auxiliary incremental trigger. Web
+Workers, Service Workers, Wake Lock, and an open browser are never required for
+the complete historical rebuild. The existing `/api/backfill` path remains an
+explicit manual full-rebuild fallback and does not auto-start in the browser.
+
 Use build and validation commands for targeted diagnosis after a remote failure, not as part of the normal checkpoint path.
 
 The timeout defaults can be overridden for a controlled canary with `SITES_INSTALL_TIMEOUT`, `SITES_INSTALL_KILL_AFTER`, `SITES_BUILD_TIMEOUT`, and `SITES_BUILD_KILL_AFTER`. A timeout fails the command; the helpers never retry an unchanged install or build.

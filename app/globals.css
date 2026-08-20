@@ -220,6 +220,14 @@ a { color: inherit; }
 
 .backfill-card { overflow: hidden; }
 .backfill-intro { margin: 15px 0 0; color: var(--muted); font-size: 10px; line-height: 1.7; }
+.snapshot-route { margin-top: 12px; padding: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid rgba(255,190,92,.25); border-radius: 14px; background: rgba(255,190,92,.055); }
+.snapshot-route > div { display: grid; gap: 4px; }
+.snapshot-route strong { color: var(--amber); font-size: 10px; }
+.snapshot-route span { color: #ddcfb1; font-size: 8px; line-height: 1.45; }
+.snapshot-route small { color: var(--muted-2); font-size: 7px; }
+.snapshot-route > b { flex: 0 0 auto; color: var(--amber); font-size: 7px; letter-spacing: .08em; }
+.snapshot-route.snapshot-ready { border-color: rgba(112,237,172,.28); background: rgba(112,237,172,.05); }
+.snapshot-route.snapshot-ready strong,.snapshot-route.snapshot-ready > b { color: var(--mint); }
 .health-pill.danger { color: var(--red); border-color: rgba(255,143,143,.24); background: rgba(255,143,143,.07); }
 .bias-guards { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 16px; }
 .bias-guards > div { min-height: 172px; padding: 15px; border: 1px solid var(--line); border-radius: 16px; background: rgba(4,14,10,.55); display: flex; flex-direction: column; }

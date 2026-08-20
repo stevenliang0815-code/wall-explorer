@@ -50,14 +50,14 @@ const worker = {
   },
 
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Invoke the app route internally, so owner-only access controls do not
-    // block the schedule and no public scheduler credential is required.
-    const response = await handler.fetch(new Request("https://scheduled.internal/api/backfill", {
+    // This is only an auxiliary daily incremental refresh. Complete historical
+    // reconstruction runs in the independent Snapshot Builder server job.
+    const response = await handler.fetch(new Request("https://scheduled.internal/api/incremental", {
       method: "POST",
-      headers: { "x-wall-backfill-trigger": "scheduled" },
+      headers: { "x-wall-incremental-trigger": "scheduled" },
     }), env, ctx);
     if (!response.ok && response.status !== 202) {
-      throw new Error(`Scheduled backfill returned HTTP ${response.status}`);
+      throw new Error(`Scheduled incremental update returned HTTP ${response.status}`);
     }
   },
 };

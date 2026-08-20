@@ -14,9 +14,9 @@ const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
 const localBindingConfig = {
   main: "./worker/index.ts",
   compatibility_flags: ["nodejs_compat"],
-  // A short, bounded backfill batch runs once per minute. The database lease
-  // prevents overlap, and completed/blocked jobs turn each tick into a no-op.
-  triggers: { crons: ["* * * * *"] },
+  // Auxiliary weekday incremental refresh after the Taiwan market closes.
+  // Full historical reconstruction is an external Snapshot Builder job.
+  triggers: { crons: ["5 9 * * 1-5"] },
   d1_databases: d1
     ? [
         {

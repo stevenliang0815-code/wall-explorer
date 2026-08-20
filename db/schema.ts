@@ -140,6 +140,44 @@ export const backfillCheckpoints = sqliteTable("backfill_checkpoints", {
   index("backfill_checkpoint_status_idx").on(table.status, table.updatedAt),
 ]);
 
+export const historicalSnapshotImports = sqliteTable("historical_snapshot_imports", {
+  id: integer("id").primaryKey(),
+  snapshotVersion: text("snapshot_version").notNull(),
+  manifestUrl: text("manifest_url").notNull(),
+  cutoffDate: text("cutoff_date").notNull(),
+  status: text("status").notNull().default("pending"),
+  expectedRows: integer("expected_rows").notNull(),
+  importedRows: integer("imported_rows").notNull().default(0),
+  nextChunk: integer("next_chunk").notNull().default(0),
+  totalChunks: integer("total_chunks").notNull(),
+  sqliteSha256: text("sqlite_sha256").notNull(),
+  lastError: text("last_error"),
+  startedAt: text("started_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+  completedAt: text("completed_at"),
+});
+
+export const historicalSnapshotChunks = sqliteTable("historical_snapshot_chunks", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  snapshotVersion: text("snapshot_version").notNull(),
+  chunkIndex: integer("chunk_index").notNull(),
+  status: text("status").notNull(),
+  rowsWritten: integer("rows_written").notNull().default(0),
+  sha256: text("sha256").notNull(),
+  importedAt: text("imported_at").notNull(),
+}, (table) => [uniqueIndex("historical_snapshot_version_chunk_uq").on(table.snapshotVersion, table.chunkIndex)]);
+
+export const dailyIncrementalRuns = sqliteTable("daily_incremental_runs", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  market: text("market").notNull(),
+  tradingDate: text("trading_date").notNull(),
+  status: text("status").notNull(),
+  rowsWritten: integer("rows_written").notNull().default(0),
+  attempts: integer("attempts").notNull().default(1),
+  lastError: text("last_error"),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [uniqueIndex("daily_incremental_market_date_uq").on(table.market, table.tradingDate)]);
+
 export const historicalSecurities = sqliteTable("historical_securities", {
   market: text("market").notNull(),
   code: text("code").notNull(),

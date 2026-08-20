@@ -21,6 +21,11 @@ type Runner = {
   schedulerLastTriggeredAt: string | null; schedulerNextExpectedAt: string | null;
   lastTriggerSource: string; schedulerHealthy?: boolean;
 };
+type SnapshotImport = {
+  snapshotVersion: string; cutoffDate: string; status: string; expectedRows: number;
+  importedRows: number; nextChunk: number; totalChunks: number; lastError: string | null;
+  startedAt: string; updatedAt: string; completedAt: string | null;
+};
 
 function weekdayMarketUnits(start: string, end: string) {
   let units = 0;
@@ -45,7 +50,7 @@ export async function GET() {
   try {
     const healthStarted = performance.now();
     const [db, d1] = await Promise.all([getDb(), getRawDb()]);
-    const [job, audits, failures, runs, runner, securities] = await Promise.all([
+    const [job, audits, failures, runs, runner, securities, snapshot] = await Promise.all([
       d1.prepare(`
         SELECT id, status, target_start AS targetStart, target_end AS targetEnd,
           cursor_date AS cursorDate, cursor_market AS cursorMarket,
@@ -87,6 +92,10 @@ export async function GET() {
       `).bind(new Date().toISOString()).first<Runner>(),
       d1.prepare("SELECT count(*) AS count, min(first_seen) AS earliestDate, max(last_seen) AS latestDate FROM historical_securities")
         .first<{ count: number; earliestDate: string | null; latestDate: string | null }>(),
+      d1.prepare(`SELECT snapshot_version AS snapshotVersion,cutoff_date AS cutoffDate,status,expected_rows AS expectedRows,
+        imported_rows AS importedRows,next_chunk AS nextChunk,total_chunks AS totalChunks,last_error AS lastError,
+        started_at AS startedAt,updated_at AS updatedAt,completed_at AS completedAt FROM historical_snapshot_imports WHERE id=1`)
+        .first<SnapshotImport>(),
     ]);
     const estimatedTotalRows = job ? estimateTotalRows(job) : 0;
     const activeRuntimeMs = runner?.activeRuntimeMs ?? 0;
@@ -113,6 +122,7 @@ export async function GET() {
         audits: audits.results,
       } : null,
       runner: runner ? { ...runner, schedulerHealthy } : null,
+      snapshot: snapshot ?? null,
       performance: {
         recentRowsPerSecond, averageRowsPerSecond, activeRuntimeMs, etaSeconds,
         abnormal: etaSeconds !== null && etaSeconds > 86_400,
@@ -130,7 +140,7 @@ export async function GET() {
   } catch {
     return Response.json({
       status: "not_started", historicalRows: 0, stockCount: 0, earliestDate: null, latestDate: null,
-      modelRuns: [], backfill: null, runner: null, policy: BACKFILL_POLICY,
+      modelRuns: [], backfill: null, runner: null, snapshot: null, policy: BACKFILL_POLICY,
       performance: {
         recentRowsPerSecond: 0, averageRowsPerSecond: 0, activeRuntimeMs: 0, etaSeconds: null,
         abnormal: false, apiRetryCount: 0, throttledMs: 0, rateLimited: false,
