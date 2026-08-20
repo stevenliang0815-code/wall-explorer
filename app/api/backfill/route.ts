@@ -5,6 +5,7 @@ import {
   BACKFILL_POLICY,
   fetchHistoricalMarketDay,
   historicalSourceUrl,
+  type FetchProfile,
   type HistoricalMarket,
   type HistoricalObservation,
 } from "../../../lib/historical-data";
@@ -24,6 +25,8 @@ type JobRow = {
   storedRows: number;
   emptyUnits: number;
   failedUnits: number;
+  phase: string;
+  estimatedTotalRows: number;
   startedAt: string;
   updatedAt: string;
   completedAt: string | null;
@@ -38,10 +41,59 @@ type RunnerRow = {
   lastFinishedAt: string | null;
   completedBatches: number;
   completedUnits: number;
+  activeRuntimeMs: number;
+  lastBatchRows: number;
+  lastBatchDurationMs: number;
+  recentRowsPerSecond: number;
+  apiRetryCount: number;
+  throttledMs: number;
+  networkMs: number;
+  parseMs: number;
+  dbWriteMs: number;
+  workerWaitMs: number;
+  rateLimited: number;
+  checkpointStatus: string;
   lastError: string | null;
 };
 
-const SERVER_BATCH = Object.freeze({ maxUnits: 12, maxRuntimeMs: 24_000, leaseMs: 45_000 });
+type UnitResult = {
+  market: HistoricalMarket;
+  tradingDate: string;
+  source: string;
+  observations: HistoricalObservation[];
+  profile: FetchProfile;
+  error: string | null;
+  audit: ReturnType<typeof auditBiasGuards> | null;
+};
+
+type BatchProfile = {
+  completedUnits: number;
+  rowsFetched: number;
+  rowsWritten: number;
+  networkMs: number;
+  parseMs: number;
+  dbWriteMs: number;
+  apiRetryCount: number;
+  throttledMs: number;
+  rateLimited: boolean;
+};
+
+const SERVER_BATCH = Object.freeze({
+  maxTradingDates: 18,
+  maxRuntimeMs: 24_000,
+  leaseMs: 45_000,
+  bulkTargetBytes: 700_000,
+  workers: 2,
+});
+
+const EMPTY_PROFILE: FetchProfile = {
+  networkMs: 0,
+  parseMs: 0,
+  retryCount: 0,
+  throttledMs: 0,
+  rateLimited: false,
+  attempts: 0,
+};
 
 function taipeiYesterday() {
   return new Date(Date.now() + 8 * 60 * 60 * 1_000 - 86_400_000).toISOString().slice(0, 10);
@@ -57,6 +109,29 @@ function calendarDays(start: string, end: string) {
   return Math.floor((Date.parse(`${end}T00:00:00Z`) - Date.parse(`${start}T00:00:00Z`)) / 86_400_000) + 1;
 }
 
+function isWeekend(date: string) {
+  const day = new Date(`${date}T12:00:00Z`).getUTCDay();
+  return day === 0 || day === 6;
+}
+
+function unitsAtCursor(job: JobRow) {
+  return job.cursorMarket === "上市" ? (["上市", "上櫃"] as HistoricalMarket[]) : (["上櫃"] as HistoricalMarket[]);
+}
+
+function emptyBatchProfile(): BatchProfile {
+  return { completedUnits: 0, rowsFetched: 0, rowsWritten: 0, networkMs: 0, parseMs: 0, dbWriteMs: 0, apiRetryCount: 0, throttledMs: 0, rateLimited: false };
+}
+
+function mergeProfile(target: BatchProfile, unit: UnitResult) {
+  target.completedUnits += 1;
+  target.rowsFetched += unit.observations.length;
+  target.networkMs += unit.profile.networkMs;
+  target.parseMs += unit.profile.parseMs;
+  target.apiRetryCount += unit.profile.retryCount;
+  target.throttledMs += unit.profile.throttledMs;
+  target.rateLimited ||= unit.profile.rateLimited;
+}
+
 async function latestJob() {
   const d1 = await getRawDb();
   return await d1.prepare(`
@@ -64,6 +139,7 @@ async function latestJob() {
       cursor_date AS cursorDate, cursor_market AS cursorMarket, status,
       processed_units AS processedUnits, total_units AS totalUnits,
       stored_rows AS storedRows, empty_units AS emptyUnits, failed_units AS failedUnits,
+      phase, estimated_total_rows AS estimatedTotalRows,
       started_at AS startedAt, updated_at AS updatedAt, completed_at AS completedAt
     FROM backfill_jobs ORDER BY id DESC LIMIT 1
   `).first<JobRow>();
@@ -76,7 +152,13 @@ async function runnerState() {
       lease_until AS leaseUntil, last_started_at AS lastStartedAt,
       last_heartbeat_at AS lastHeartbeatAt, last_finished_at AS lastFinishedAt,
       completed_batches AS completedBatches, completed_units AS completedUnits,
-      last_error AS lastError
+      active_runtime_ms AS activeRuntimeMs, last_batch_rows AS lastBatchRows,
+      last_batch_duration_ms AS lastBatchDurationMs,
+      recent_rows_per_second AS recentRowsPerSecond,
+      api_retry_count AS apiRetryCount, throttled_ms AS throttledMs,
+      network_ms AS networkMs, parse_ms AS parseMs, db_write_ms AS dbWriteMs,
+      worker_wait_ms AS workerWaitMs, rate_limited AS rateLimited,
+      checkpoint_status AS checkpointStatus, last_error AS lastError
     FROM backfill_runner WHERE id = 1
   `).bind(new Date().toISOString()).first<RunnerRow>();
 }
@@ -98,37 +180,11 @@ async function acquireRunnerLease(token: string) {
   const result = await d1.prepare(`
     UPDATE backfill_runner SET
       status = 'running', lease_token = ?, lease_until = ?,
-      last_started_at = ?, last_heartbeat_at = ?, last_error = NULL
+      last_started_at = ?, last_heartbeat_at = ?, last_error = NULL,
+      checkpoint_status = 'writing'
     WHERE id = 1 AND (status != 'running' OR lease_until IS NULL OR lease_until < ?)
   `).bind(token, leaseUntil, nowIso, nowIso, nowIso).run();
   return (result.meta.changes ?? 0) > 0;
-}
-
-async function heartbeatRunner(token: string, completedUnits: number) {
-  const d1 = await getRawDb();
-  const now = new Date();
-  await d1.prepare(`
-    UPDATE backfill_runner SET
-      lease_until = ?, last_heartbeat_at = ?, completed_units = completed_units + ?
-    WHERE id = 1 AND lease_token = ?
-  `).bind(
-    new Date(now.getTime() + SERVER_BATCH.leaseMs).toISOString(),
-    now.toISOString(),
-    completedUnits,
-    token,
-  ).run();
-}
-
-async function releaseRunner(token: string, error: string | null) {
-  const d1 = await getRawDb();
-  const now = new Date().toISOString();
-  await d1.prepare(`
-    UPDATE backfill_runner SET
-      status = ?, lease_token = NULL, lease_until = NULL,
-      last_finished_at = ?, last_heartbeat_at = ?,
-      completed_batches = completed_batches + 1, last_error = ?
-    WHERE id = 1 AND lease_token = ?
-  `).bind(error ? "error" : "idle", now, now, error?.slice(0, 500) ?? null, token).run();
 }
 
 async function createJob() {
@@ -140,8 +196,8 @@ async function createJob() {
     INSERT INTO backfill_jobs (
       version, target_start, target_end, cursor_date, cursor_market, status,
       processed_units, total_units, stored_rows, empty_units, failed_units,
-      started_at, updated_at
-    ) VALUES (?, ?, ?, ?, '上市', 'running', 0, ?, 0, 0, 0, ?, ?)
+      phase, estimated_total_rows, started_at, updated_at
+    ) VALUES (?, ?, ?, ?, '上市', 'running', 0, ?, 0, 0, 0, 'raw_history', 0, ?, ?)
   `).bind(BACKFILL_POLICY.version, BACKFILL_POLICY.targetStart, targetEnd, targetEnd, totalUnits, now, now).run();
   const job = await latestJob();
   if (!job) throw new Error("Backfill job could not be created");
@@ -149,145 +205,220 @@ async function createJob() {
 }
 
 async function alignJobWithPolicy(job: JobRow) {
-  if (job.targetStart <= BACKFILL_POLICY.targetStart) return job;
   const d1 = await getRawDb();
-  const additionalUnits = calendarDays(BACKFILL_POLICY.targetStart, dayBefore(job.targetStart)) * 2;
+  const additionalUnits = job.targetStart > BACKFILL_POLICY.targetStart
+    ? calendarDays(BACKFILL_POLICY.targetStart, dayBefore(job.targetStart)) * 2
+    : 0;
   await d1.prepare(`
     UPDATE backfill_jobs SET
-      target_start = ?,
-      total_units = total_units + ?,
-      status = 'running',
-      completed_at = NULL,
-      updated_at = ?
+      version = ?, target_start = CASE WHEN target_start > ? THEN ? ELSE target_start END,
+      total_units = total_units + ?, phase = 'raw_history', updated_at = ?
     WHERE id = ?
-  `).bind(BACKFILL_POLICY.targetStart, additionalUnits, new Date().toISOString(), job.id).run();
+  `).bind(BACKFILL_POLICY.version, BACKFILL_POLICY.targetStart, BACKFILL_POLICY.targetStart, additionalUnits, new Date().toISOString(), job.id).run();
   return await latestJob() ?? job;
 }
 
-function nextCursor(job: JobRow) {
-  if (job.cursorMarket === "上市") return { date: job.cursorDate, market: "上櫃" as const };
-  return { date: dayBefore(job.cursorDate), market: "上市" as const };
+function chunkByEncodedSize(rows: HistoricalObservation[]) {
+  const chunks: string[] = [];
+  let current: HistoricalObservation[] = [];
+  let currentBytes = 2;
+  for (const row of rows) {
+    const encoded = JSON.stringify(row);
+    const bytes = new TextEncoder().encode(encoded).byteLength + 1;
+    if (current.length && currentBytes + bytes > SERVER_BATCH.bulkTargetBytes) {
+      chunks.push(JSON.stringify(current));
+      current = [];
+      currentBytes = 2;
+    }
+    current.push(row);
+    currentBytes += bytes;
+  }
+  if (current.length) chunks.push(JSON.stringify(current));
+  return chunks;
 }
 
-async function storeObservations(job: JobRow, observations: HistoricalObservation[]) {
-  if (!observations.length) return;
-  const d1 = await getRawDb();
-  const ingestedAt = new Date().toISOString();
-  const statements = observations.map((row) => d1.prepare(`
+function observationUpsert(d1: D1Database, payload: string, ingestedAt: string, jobId: number) {
+  return d1.prepare(`
     INSERT INTO historical_observations (
       market, code, name, trading_date, security_type, universe_status,
       open, high, low, close, change, volume, trade_value, source,
       source_scope, usable_from, ingested_at, backfill_job_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )
+    SELECT
+      json_extract(value, '$.market'), json_extract(value, '$.code'),
+      json_extract(value, '$.name'), json_extract(value, '$.tradingDate'),
+      json_extract(value, '$.securityType'), json_extract(value, '$.universeStatus'),
+      json_extract(value, '$.open'), json_extract(value, '$.high'),
+      json_extract(value, '$.low'), json_extract(value, '$.close'),
+      json_extract(value, '$.change'), json_extract(value, '$.volume'),
+      json_extract(value, '$.tradeValue'), json_extract(value, '$.source'),
+      json_extract(value, '$.sourceScope'), json_extract(value, '$.usableFrom'), ?, ?
+    FROM json_each(?) WHERE 1
     ON CONFLICT(market, code, trading_date) DO UPDATE SET
-      name = excluded.name,
-      security_type = excluded.security_type,
-      universe_status = excluded.universe_status,
-      open = excluded.open,
-      high = excluded.high,
-      low = excluded.low,
-      close = excluded.close,
-      change = excluded.change,
-      volume = excluded.volume,
-      trade_value = excluded.trade_value,
-      source = excluded.source,
-      source_scope = excluded.source_scope,
-      usable_from = excluded.usable_from,
-      ingested_at = excluded.ingested_at,
-      backfill_job_id = excluded.backfill_job_id
-  `).bind(
-    row.market, row.code, row.name, row.tradingDate, row.securityType, row.universeStatus,
-    row.open, row.high, row.low, row.close, row.change, row.volume, row.tradeValue,
-    row.source, row.sourceScope, row.usableFrom, ingestedAt, job.id,
-  ));
+      name = excluded.name, security_type = excluded.security_type,
+      universe_status = excluded.universe_status, open = excluded.open,
+      high = excluded.high, low = excluded.low, close = excluded.close,
+      change = excluded.change, volume = excluded.volume,
+      trade_value = excluded.trade_value, source = excluded.source,
+      source_scope = excluded.source_scope, usable_from = excluded.usable_from,
+      ingested_at = excluded.ingested_at, backfill_job_id = excluded.backfill_job_id
+  `).bind(ingestedAt, jobId, payload);
+}
 
-  for (let index = 0; index < statements.length; index += 50) {
-    await d1.batch(statements.slice(index, index + 50));
+function securityUpsert(d1: D1Database, payload: string) {
+  return d1.prepare(`
+    INSERT INTO historical_securities (market, code, name, security_type, first_seen, last_seen)
+    SELECT
+      json_extract(value, '$.market'), json_extract(value, '$.code'),
+      json_extract(value, '$.name'), json_extract(value, '$.securityType'),
+      json_extract(value, '$.tradingDate'), json_extract(value, '$.tradingDate')
+    FROM json_each(?) WHERE 1
+    ON CONFLICT(market, code) DO UPDATE SET
+      name = excluded.name, security_type = excluded.security_type,
+      first_seen = min(first_seen, excluded.first_seen),
+      last_seen = max(last_seen, excluded.last_seen)
+  `).bind(payload);
+}
+
+async function fetchUnit(market: HistoricalMarket, tradingDate: string): Promise<UnitResult> {
+  if (isWeekend(tradingDate)) {
+    return { market, tradingDate, source: historicalSourceUrl(market, tradingDate), observations: [], profile: { ...EMPTY_PROFILE }, error: null, audit: auditBiasGuards([], tradingDate) };
   }
-}
-
-async function storeAudits(job: JobRow, market: HistoricalMarket, tradingDate: string, observations: HistoricalObservation[]) {
-  const d1 = await getRawDb();
-  const checkedAt = new Date().toISOString();
-  const audits = auditBiasGuards(observations, tradingDate);
-  const rows = [
-    ["survivorship", audits.survivorship.status, audits.survivorship.violations, audits.survivorship.rule],
-    ["lookahead", audits.lookAhead.status, audits.lookAhead.violations, audits.lookAhead.rule],
-  ] as const;
-  await d1.batch(rows.map(([type, status, violations, rule]) => d1.prepare(`
-    INSERT INTO bias_audits (
-      backfill_job_id, market, trading_date, audit_type, status,
-      checked_rows, violations, rule, checked_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(backfill_job_id, market, trading_date, audit_type) DO UPDATE SET
-      status = excluded.status,
-      checked_rows = excluded.checked_rows,
-      violations = excluded.violations,
-      rule = excluded.rule,
-      checked_at = excluded.checked_at
-  `).bind(job.id, market, tradingDate, type, status, observations.length, violations, rule, checkedAt)));
-  return audits;
-}
-
-async function recordFailure(job: JobRow, market: HistoricalMarket, tradingDate: string, error: string) {
-  const d1 = await getRawDb();
-  const now = new Date().toISOString();
-  await d1.prepare(`
-    INSERT INTO backfill_failures (
-      backfill_job_id, market, trading_date, source, error, attempts, status, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, 1, 'open', ?, ?)
-    ON CONFLICT(backfill_job_id, market, trading_date) DO UPDATE SET
-      error = excluded.error,
-      attempts = backfill_failures.attempts + 1,
-      status = 'open',
-      updated_at = excluded.updated_at
-  `).bind(job.id, market, tradingDate, historicalSourceUrl(market, tradingDate), error.slice(0, 500), now, now).run();
-}
-
-async function updateJob(job: JobRow, counts: { stored: number; empty: number; failed: number }, forceStatus?: string) {
-  const d1 = await getRawDb();
-  const cursor = nextCursor(job);
-  const finished = cursor.date < job.targetStart;
-  const failedTotal = job.failedUnits + counts.failed;
-  const status = forceStatus ?? (finished ? (failedTotal ? "complete_with_gaps" : "complete") : "running");
-  const now = new Date().toISOString();
-  await d1.prepare(`
-    UPDATE backfill_jobs SET
-      cursor_date = ?, cursor_market = ?, status = ?,
-      processed_units = processed_units + 1,
-      stored_rows = stored_rows + ?, empty_units = empty_units + ?, failed_units = failed_units + ?,
-      updated_at = ?, completed_at = ?
-    WHERE id = ?
-  `).bind(cursor.date, cursor.market, status, counts.stored, counts.empty, counts.failed, now, finished ? now : null, job.id).run();
-}
-
-async function runOneUnit(job: JobRow) {
   try {
-    const result = await fetchHistoricalMarketDay(job.cursorMarket, job.cursorDate);
-    if (!result.observations.length) {
-      await updateJob(job, { stored: 0, empty: 1, failed: 0 });
-      return;
-    }
-    const audits = await storeAudits(job, job.cursorMarket, job.cursorDate, result.observations);
-    if (audits.survivorship.status !== "pass" || audits.lookAhead.status !== "pass") {
-      await updateJob(job, { stored: 0, empty: 0, failed: 0 }, "blocked_bias_violation");
-      return;
-    }
-    await storeObservations(job, result.observations);
-    await updateJob(job, { stored: result.observations.length, empty: 0, failed: 0 });
+    const result = await fetchHistoricalMarketDay(market, tradingDate);
+    return {
+      market, tradingDate, source: result.source, observations: result.observations,
+      profile: result.profile, error: null, audit: auditBiasGuards(result.observations, tradingDate),
+    };
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown backfill error";
-    await recordFailure(job, job.cursorMarket, job.cursorDate, message);
-    await updateJob(job, { stored: 0, empty: 0, failed: 1 });
+    const profiled = error as Error & { fetchProfile?: FetchProfile };
+    return {
+      market, tradingDate, source: historicalSourceUrl(market, tradingDate), observations: [],
+      profile: profiled.fetchProfile ?? { ...EMPTY_PROFILE }, error: profiled.message || "Unknown backfill error", audit: null,
+    };
   }
 }
 
-async function retryOneFailure(job: JobRow) {
+async function writeDateTransaction(job: JobRow, batchId: string, token: string, units: UnitResult[], advanceCursor = true) {
+  const d1 = await getRawDb();
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const statements: D1PreparedStatement[] = [];
+  let stored = 0;
+  let empty = 0;
+  let failed = 0;
+  let blocked = false;
+
+  for (const unit of units) {
+    const auditBlocked = unit.audit && (unit.audit.survivorship.status !== "pass" || unit.audit.lookAhead.status !== "pass");
+    blocked ||= Boolean(auditBlocked);
+    if (unit.error) failed += 1;
+    else if (!unit.observations.length) empty += 1;
+    else if (!auditBlocked) stored += unit.observations.length;
+
+    if (!unit.error && !auditBlocked) {
+      for (const payload of chunkByEncodedSize(unit.observations)) {
+        statements.push(observationUpsert(d1, payload, nowIso, job.id));
+        statements.push(securityUpsert(d1, payload));
+      }
+      statements.push(d1.prepare(`
+        UPDATE backfill_failures SET status = 'resolved', updated_at = ?
+        WHERE backfill_job_id = ? AND market = ? AND trading_date = ? AND status = 'open'
+      `).bind(nowIso, job.id, unit.market, unit.tradingDate));
+    }
+
+    if (unit.audit) {
+      const auditRows = [
+        ["survivorship", unit.audit.survivorship.status, unit.audit.survivorship.violations, unit.audit.survivorship.rule],
+        ["lookahead", unit.audit.lookAhead.status, unit.audit.lookAhead.violations, unit.audit.lookAhead.rule],
+      ] as const;
+      for (const [type, status, violations, rule] of auditRows) {
+        statements.push(d1.prepare(`
+          INSERT INTO bias_audits (
+            backfill_job_id, market, trading_date, audit_type, status,
+            checked_rows, violations, rule, checked_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(backfill_job_id, market, trading_date, audit_type) DO UPDATE SET
+            status = excluded.status, checked_rows = excluded.checked_rows,
+            violations = excluded.violations, rule = excluded.rule, checked_at = excluded.checked_at
+        `).bind(job.id, unit.market, unit.tradingDate, type, status, unit.observations.length, violations, rule, nowIso));
+      }
+    }
+
+    if (unit.error) {
+      statements.push(d1.prepare(`
+        INSERT INTO backfill_failures (
+          backfill_job_id, market, trading_date, source, error, attempts, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 1, 'open', ?, ?)
+        ON CONFLICT(backfill_job_id, market, trading_date) DO UPDATE SET
+          source = excluded.source, error = excluded.error,
+          attempts = backfill_failures.attempts + 1, status = 'open', updated_at = excluded.updated_at
+      `).bind(job.id, unit.market, unit.tradingDate, unit.source, unit.error.slice(0, 500), nowIso, nowIso));
+    }
+
+    const checkpointStatus = unit.error ? "failed" : auditBlocked ? "blocked" : unit.observations.length ? "completed" : "completed_empty";
+    statements.push(d1.prepare(`
+      INSERT INTO backfill_checkpoints (
+        backfill_job_id, market, trading_date, status, batch_id,
+        rows_fetched, rows_written, attempts, last_error, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(backfill_job_id, market, trading_date) DO UPDATE SET
+        status = excluded.status, batch_id = excluded.batch_id,
+        rows_fetched = excluded.rows_fetched, rows_written = excluded.rows_written,
+        attempts = backfill_checkpoints.attempts + excluded.attempts,
+        last_error = excluded.last_error, updated_at = excluded.updated_at
+    `).bind(
+      job.id, unit.market, unit.tradingDate, checkpointStatus, batchId,
+      unit.observations.length, unit.error || auditBlocked ? 0 : unit.observations.length,
+      Math.max(1, unit.profile.attempts), unit.error?.slice(0, 500) ?? null, nowIso,
+    ));
+  }
+
+  const cursorDate = dayBefore(job.cursorDate);
+  const finished = cursorDate < job.targetStart;
+  const status = blocked ? "blocked_bias_violation" : advanceCursor
+    ? finished ? (job.failedUnits + failed > 0 ? "complete_with_gaps" : "complete") : "running"
+    : job.status;
+  const retryCount = units.reduce((sum, unit) => sum + unit.profile.retryCount, 0);
+  const throttledMs = Math.round(units.reduce((sum, unit) => sum + unit.profile.throttledMs, 0));
+  if (advanceCursor) {
+    statements.push(d1.prepare(`
+      UPDATE backfill_jobs SET
+        cursor_date = ?, cursor_market = '上市', status = ?,
+        processed_units = processed_units + ?, stored_rows = stored_rows + ?,
+        empty_units = empty_units + ?, failed_units = failed_units + ?,
+        last_batch_id = ?, last_batch_rows = ?, last_checkpoint_at = ?,
+        api_retry_count = api_retry_count + ?, throttled_ms = throttled_ms + ?,
+        updated_at = ?, completed_at = ?
+      WHERE id = ?
+    `).bind(
+      cursorDate, status, units.length, stored, empty, failed, batchId, stored, nowIso,
+      retryCount, throttledMs, nowIso, finished ? nowIso : null, job.id,
+    ));
+  } else {
+    statements.push(d1.prepare(`
+      UPDATE backfill_jobs SET
+        status = ?, stored_rows = stored_rows + ?, last_batch_id = ?,
+        last_batch_rows = ?, last_checkpoint_at = ?, api_retry_count = api_retry_count + ?,
+        throttled_ms = throttled_ms + ?, updated_at = ? WHERE id = ?
+    `).bind(status, stored, batchId, stored, nowIso, retryCount, throttledMs, nowIso, job.id));
+  }
+  statements.push(d1.prepare(`
+    UPDATE backfill_runner SET lease_until = ?, last_heartbeat_at = ?,
+      completed_units = completed_units + ?, checkpoint_status = ?
+    WHERE id = 1 AND lease_token = ?
+  `).bind(new Date(now.getTime() + SERVER_BATCH.leaseMs).toISOString(), nowIso, units.length, blocked ? "blocked" : "saved", token));
+
+  const started = performance.now();
+  await d1.batch(statements);
+  return { stored, dbWriteMs: performance.now() - started, status };
+}
+
+async function retryOneFailure(job: JobRow, batchId: string, token: string, profile: BatchProfile) {
   const d1 = await getRawDb();
   const failure = await d1.prepare(`
     SELECT id, market, trading_date AS tradingDate
-    FROM backfill_failures
-    WHERE backfill_job_id = ? AND status = 'open'
+    FROM backfill_failures WHERE backfill_job_id = ? AND status = 'open'
     ORDER BY trading_date DESC, market LIMIT 1
   `).bind(job.id).first<FailureRow>();
   if (!failure) {
@@ -296,91 +427,152 @@ async function retryOneFailure(job: JobRow) {
       .bind(now, now, job.id).run();
     return;
   }
-
-  try {
-    const result = await fetchHistoricalMarketDay(failure.market, failure.tradingDate);
-    if (result.observations.length) {
-      const audits = await storeAudits(job, failure.market, failure.tradingDate, result.observations);
-      if (audits.survivorship.status !== "pass" || audits.lookAhead.status !== "pass") {
-        await d1.prepare("UPDATE backfill_jobs SET status = 'blocked_bias_violation', updated_at = ? WHERE id = ?")
-          .bind(new Date().toISOString(), job.id).run();
-        return;
-      }
-      await storeObservations(job, result.observations);
-    }
+  const unit = await fetchUnit(failure.market, failure.tradingDate);
+  mergeProfile(profile, unit);
+  if (unit.error) {
     const now = new Date().toISOString();
     await d1.batch([
-      d1.prepare("UPDATE backfill_failures SET status = 'resolved', updated_at = ? WHERE id = ?").bind(now, failure.id),
-      d1.prepare(`
-        UPDATE backfill_jobs SET
-          stored_rows = stored_rows + ?,
-          failed_units = max(failed_units - 1, 0),
-          updated_at = ?
-        WHERE id = ?
-      `).bind(result.observations.length, now, job.id),
+      d1.prepare("UPDATE backfill_failures SET error = ?, attempts = attempts + 1, updated_at = ? WHERE id = ?")
+        .bind(unit.error.slice(0, 500), now, failure.id),
+      d1.prepare("UPDATE backfill_runner SET last_heartbeat_at = ?, checkpoint_status = 'retry_failed' WHERE id = 1 AND lease_token = ?")
+        .bind(now, token),
     ]);
-    const remaining = await d1.prepare("SELECT count(*) AS count FROM backfill_failures WHERE backfill_job_id = ? AND status = 'open'")
-      .bind(job.id).first<{ count: number }>();
-    if ((remaining?.count ?? 0) === 0) {
-      await d1.prepare("UPDATE backfill_jobs SET status = 'complete', completed_at = ?, updated_at = ? WHERE id = ?")
-        .bind(now, now, job.id).run();
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown retry error";
-    await recordFailure(job, failure.market, failure.tradingDate, message);
+    return;
   }
+  const retriedJob = { ...job, cursorDate: failure.tradingDate, cursorMarket: failure.market };
+  const write = await writeDateTransaction(retriedJob, batchId, token, [unit], false);
+  profile.rowsWritten += write.stored;
+  profile.dbWriteMs += write.dbWriteMs;
+  const now = new Date().toISOString();
+  await d1.batch([
+    d1.prepare("UPDATE backfill_failures SET status = 'resolved', updated_at = ? WHERE id = ?").bind(now, failure.id),
+    d1.prepare("UPDATE backfill_jobs SET failed_units = max(failed_units - 1, 0), status = 'complete_with_gaps', updated_at = ? WHERE id = ?")
+      .bind(now, job.id),
+  ]);
 }
 
-async function runServerBatch(maxUnits = SERVER_BATCH.maxUnits) {
+async function finishBatch(token: string, batchId: string, startedAtMs: number, profile: BatchProfile, error: string | null) {
+  const d1 = await getRawDb();
+  const finishedAt = new Date().toISOString();
+  const durationMs = Math.max(1, Math.round(performance.now() - startedAtMs));
+  const recentRowsPerSecond = profile.rowsWritten / (durationMs / 1_000);
+  const workerWaitMs = Math.max(0, durationMs - profile.networkMs - profile.parseMs - profile.dbWriteMs);
+  await d1.batch([
+    d1.prepare(`
+      UPDATE backfill_batches SET finished_at = ?, status = ?, completed_units = ?,
+        rows_fetched = ?, rows_written = ?, network_ms = ?, parse_ms = ?, db_write_ms = ?,
+        api_retry_count = ?, throttled_ms = ?, worker_wait_ms = ?, error = ? WHERE batch_id = ?
+    `).bind(
+      finishedAt, error ? "error" : "complete", profile.completedUnits, profile.rowsFetched, profile.rowsWritten,
+      Math.round(profile.networkMs), Math.round(profile.parseMs), Math.round(profile.dbWriteMs),
+      profile.apiRetryCount, Math.round(profile.throttledMs), Math.round(workerWaitMs), error?.slice(0, 500) ?? null, batchId,
+    ),
+    d1.prepare(`
+      UPDATE backfill_runner SET status = ?, lease_token = NULL, lease_until = NULL,
+        last_finished_at = ?, last_heartbeat_at = ?, completed_batches = completed_batches + 1,
+        active_runtime_ms = active_runtime_ms + ?, last_batch_rows = ?, last_batch_duration_ms = ?,
+        recent_rows_per_second = ?, api_retry_count = api_retry_count + ?, throttled_ms = throttled_ms + ?,
+        network_ms = network_ms + ?, parse_ms = parse_ms + ?, db_write_ms = db_write_ms + ?,
+        worker_wait_ms = worker_wait_ms + ?, rate_limited = ?, checkpoint_status = ?, last_error = ?
+      WHERE id = 1 AND lease_token = ?
+    `).bind(
+      error ? "error" : "idle", finishedAt, finishedAt, durationMs, profile.rowsWritten, durationMs,
+      recentRowsPerSecond, profile.apiRetryCount, Math.round(profile.throttledMs), Math.round(profile.networkMs),
+      Math.round(profile.parseMs), Math.round(profile.dbWriteMs), Math.round(workerWaitMs), profile.rateLimited ? 1 : 0,
+      error ? "error" : "saved", error?.slice(0, 500) ?? null, token,
+    ),
+  ]);
+}
+
+async function runServerBatch(maxTradingDates = SERVER_BATCH.maxTradingDates) {
   const token = globalThis.crypto.randomUUID();
   if (!(await acquireRunnerLease(token))) return;
-
+  const batchId = globalThis.crypto.randomUUID();
+  const startedAt = new Date().toISOString();
+  const startedAtMs = performance.now();
   const deadline = Date.now() + SERVER_BATCH.maxRuntimeMs;
-  let completedUnits = 0;
+  const profile = emptyBatchProfile();
   let batchError: string | null = null;
+  let job = await latestJob();
+  if (!job) job = await createJob();
+  job = await alignJobWithPolicy(job);
+  const d1 = await getRawDb();
+  await d1.prepare(`INSERT INTO backfill_batches (batch_id, backfill_job_id, started_at, status) VALUES (?, ?, ?, 'running')`)
+    .bind(batchId, job.id, startedAt).run();
+
   try {
-    while (completedUnits < maxUnits && Date.now() < deadline) {
-      let job = await latestJob();
-      if (!job) job = await createJob();
-      job = await alignJobWithPolicy(job);
-
-      if (job.status === "running") await runOneUnit(job);
-      else if (job.status === "complete_with_gaps") await retryOneFailure(job);
-      else break;
-
-      completedUnits += 1;
-      await heartbeatRunner(token, 1);
+    let completedDates = 0;
+    while (completedDates < maxTradingDates && Date.now() < deadline) {
+      job = await latestJob() ?? job;
+      if (job.status === "running") {
+        const units = await Promise.all(unitsAtCursor(job).map((market) => fetchUnit(market, job.cursorDate)));
+        for (const unit of units) mergeProfile(profile, unit);
+        const write = await writeDateTransaction(job, batchId, token, units);
+        profile.rowsWritten += write.stored;
+        profile.dbWriteMs += write.dbWriteMs;
+        completedDates += 1;
+        if (write.status === "blocked_bias_violation") break;
+      } else if (job.status === "complete_with_gaps") {
+        await retryOneFailure(job, batchId, token, profile);
+        completedDates += 1;
+      } else break;
     }
   } catch (error) {
     batchError = error instanceof Error ? error.message : "Unknown server runner error";
   } finally {
-    await releaseRunner(token, batchError);
+    await finishBatch(token, batchId, startedAtMs, profile, batchError);
   }
 }
 
+function estimateTotalRows(job: JobRow) {
+  const successfulUnits = Math.max(1, job.processedUnits - job.emptyUnits - job.failedUnits);
+  const observedAverage = job.storedRows / successfulUnits;
+  const blendedAverage = job.failedUnits > successfulUnits ? (observedAverage + 850) / 2 : observedAverage;
+  return Math.max(job.storedRows, Math.round(blendedAverage * job.totalUnits));
+}
+
 async function healthPayload() {
+  const healthStarted = performance.now();
   const d1 = await getRawDb();
   const job = await latestJob();
-  const audits = await d1.prepare(`
-    SELECT audit_type AS auditType,
-      SUM(CASE WHEN status = 'pass' THEN 1 ELSE 0 END) AS passed,
-      SUM(CASE WHEN status != 'pass' THEN 1 ELSE 0 END) AS blocked,
-      SUM(violations) AS violations
-    FROM bias_audits GROUP BY audit_type
-  `).all<{ auditType: string; passed: number; blocked: number; violations: number }>();
-  const [openFailures, runner] = await Promise.all([
+  const [audits, openFailures, runner, securities] = await Promise.all([
+    d1.prepare(`
+      SELECT audit_type AS auditType,
+        SUM(CASE WHEN status = 'pass' THEN 1 ELSE 0 END) AS passed,
+        SUM(CASE WHEN status != 'pass' THEN 1 ELSE 0 END) AS blocked,
+        SUM(violations) AS violations FROM bias_audits GROUP BY audit_type
+    `).all<{ auditType: string; passed: number; blocked: number; violations: number }>(),
     d1.prepare("SELECT count(*) AS count FROM backfill_failures WHERE status = 'open'").first<{ count: number }>(),
     runnerState(),
+    d1.prepare("SELECT count(*) AS count, min(first_seen) AS earliestDate, max(last_seen) AS latestDate FROM historical_securities")
+      .first<{ count: number; earliestDate: string | null; latestDate: string | null }>(),
   ]);
+  const estimatedTotalRows = job ? estimateTotalRows(job) : 0;
+  const activeRuntimeMs = runner?.activeRuntimeMs ?? 0;
+  const averageRowsPerSecond = job && activeRuntimeMs > 0 ? job.storedRows / (activeRuntimeMs / 1_000) : 0;
+  const recentRowsPerSecond = runner?.recentRowsPerSecond ?? 0;
+  const etaRate = recentRowsPerSecond > 0 ? recentRowsPerSecond : averageRowsPerSecond;
+  const etaSeconds = job && etaRate > 0 ? Math.max(0, (estimatedTotalRows - job.storedRows) / etaRate) : null;
   return {
     status: job?.status ?? "not_started",
-    job,
+    job: job ? { ...job, estimatedTotalRows } : null,
     progress: job ? Math.min(100, Number(((job.processedUnits / Math.max(job.totalUnits, 1)) * 100).toFixed(2))) : 0,
-    audits: audits.results,
-    openFailures: openFailures?.count ?? 0,
-    runner: runner ?? null,
-    serverBatch: SERVER_BATCH,
-    policy: BACKFILL_POLICY,
+    rowProgress: job ? Math.min(100, Number(((job.storedRows / Math.max(estimatedTotalRows, 1)) * 100).toFixed(2))) : 0,
+    performance: {
+      recentRowsPerSecond, averageRowsPerSecond, activeRuntimeMs, etaSeconds,
+      abnormal: etaSeconds !== null && etaSeconds > 86_400,
+      apiRetryCount: runner?.apiRetryCount ?? 0, throttledMs: runner?.throttledMs ?? 0,
+      rateLimited: Boolean(runner?.rateLimited), networkMs: runner?.networkMs ?? 0,
+      parseMs: runner?.parseMs ?? 0, dbWriteMs: runner?.dbWriteMs ?? 0,
+      workerWaitMs: runner?.workerWaitMs ?? 0, featureMs: 0,
+      healthQueryMs: Math.round(performance.now() - healthStarted),
+    },
+    currentStage: "下載原始行情 → 正規化 → 驗證 → 批次寫入",
+    nextStages: ["資料清洗／公司事件／除權息", "Feature Engineering", "Walk-Forward 樣本外回測", "機率校準", "解鎖研究候選"],
+    audits: audits.results, openFailures: openFailures?.count ?? 0,
+    historicalRows: job?.storedRows ?? 0, stockCount: securities?.count ?? 0,
+    earliestDate: securities?.earliestDate ?? null, latestDate: securities?.latestDate ?? null,
+    runner: runner ?? null, serverBatch: SERVER_BATCH, policy: BACKFILL_POLICY,
   };
 }
 
@@ -388,7 +580,7 @@ export async function GET() {
   try {
     return Response.json(await healthPayload(), { headers: { "Cache-Control": "no-store" } });
   } catch {
-    return Response.json({ status: "unavailable", job: null, progress: 0, audits: [], openFailures: 0, runner: null, serverBatch: SERVER_BATCH, policy: BACKFILL_POLICY }, { status: 503 });
+    return Response.json({ status: "unavailable", job: null, progress: 0, rowProgress: 0, audits: [], openFailures: 0, runner: null, serverBatch: SERVER_BATCH, policy: BACKFILL_POLICY }, { status: 503 });
   }
 }
 
@@ -399,13 +591,9 @@ export async function POST() {
       executionContext.waitUntil(runServerBatch());
       return Response.json({ accepted: true, mode: "server_background", ...(await healthPayload()) }, { status: 202, headers: { "Cache-Control": "no-store" } });
     }
-
     await runServerBatch(1);
     return Response.json({ accepted: true, mode: "server_foreground_fallback", ...(await healthPayload()) }, { headers: { "Cache-Control": "no-store" } });
-  } catch (error) {
-    const message = error instanceof Error && error.message.startsWith("Official historical source")
-      ? "官方歷史資料來源暫時無法取得"
-      : "回填資料庫尚未就緒，這次沒有寫入任何資料";
-    return Response.json({ status: "unavailable", error: message, policy: BACKFILL_POLICY }, { status: 503 });
+  } catch {
+    return Response.json({ status: "unavailable", error: "回填資料庫尚未就緒，這次沒有寫入任何資料", policy: BACKFILL_POLICY }, { status: 503 });
   }
 }

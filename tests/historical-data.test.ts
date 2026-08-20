@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { auditBiasGuards, BACKFILL_POLICY, parseHistoricalReport } from "../lib/historical-data.ts";
+import { auditBiasGuards, BACKFILL_POLICY, historicalSourceUrls, parseHistoricalReport, parseLegacyTpexReport } from "../lib/historical-data.ts";
 
 test("point-in-time parser retains securities without consulting today's listing directory", () => {
   const report = {
@@ -37,4 +37,16 @@ test("look-ahead audit blocks same-day feature availability", () => {
   const audit = auditBiasGuards(invalid, "2020-01-02");
   assert.equal(audit.lookAhead.status, "blocked");
   assert.equal(audit.lookAhead.violations, 1);
+});
+
+test("legacy TPEx full-market fallback keeps delisted candidates and point-in-time availability", () => {
+  const rows = parseLegacyTpexReport({ aaData: [
+    ["5274", "信驊", "5,000", "25", "4,980", "5,020", "4,950", "4,990", "12,000", "60,000,000"],
+    ["1234", "後來下櫃樣本", "40", "-2", "42", "43", "39", "41", "2,000", "80,000"],
+  ] }, "2020-01-02", "https://www.tpex.org.tw/official-full-market");
+  assert.deepEqual(rows.map((row) => row.code), ["5274", "1234"]);
+  assert.equal(rows[1].change, -2);
+  assert.equal(rows[1].usableFrom, "2020-01-03T00:00:00+08:00");
+  assert.equal(auditBiasGuards(rows, "2020-01-02").lookAhead.status, "pass");
+  assert.match(historicalSourceUrls("上櫃", "2020-01-02")[1], /daily_close_quotes\/stk_quote_result\.php/);
 });

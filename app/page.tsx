@@ -57,6 +57,14 @@ type ModelHealth = {
     storedRows: number;
     emptyUnits: number;
     failedUnits: number;
+    phase: string;
+    estimatedTotalRows: number;
+    rowProgress: number;
+    lastBatchId: string | null;
+    lastBatchRows: number;
+    lastCheckpointAt: string | null;
+    apiRetryCount: number;
+    throttledMs: number;
     openFailures: number;
     progress: number;
     updatedAt: string;
@@ -70,14 +78,46 @@ type ModelHealth = {
     lastFinishedAt: string | null;
     completedBatches: number;
     completedUnits: number;
+    activeRuntimeMs: number;
+    lastBatchRows: number;
+    lastBatchDurationMs: number;
+    recentRowsPerSecond: number;
+    apiRetryCount: number;
+    throttledMs: number;
+    networkMs: number;
+    parseMs: number;
+    dbWriteMs: number;
+    workerWaitMs: number;
+    rateLimited: number;
+    checkpointStatus: string;
     lastError: string | null;
   };
+  performance: {
+    recentRowsPerSecond: number;
+    averageRowsPerSecond: number;
+    activeRuntimeMs: number;
+    etaSeconds: number | null;
+    abnormal: boolean;
+    apiRetryCount: number;
+    throttledMs: number;
+    rateLimited: boolean;
+    networkMs: number;
+    parseMs: number;
+    dbWriteMs: number;
+    workerWaitMs: number;
+    featureMs: number;
+    healthQueryMs: number;
+  };
+  currentStage: string;
+  nextStages: string[];
   policy: { version: string; targetStart: string; universe: string; usesCurrentListings: boolean; featureAvailability: string };
 };
 
 const emptyHealth: ModelHealth = {
   status: "not_started", historicalRows: 0, stockCount: 0, earliestDate: null, latestDate: null,
   modelRuns: [], backfill: null, runner: null,
+  performance: { recentRowsPerSecond: 0, averageRowsPerSecond: 0, activeRuntimeMs: 0, etaSeconds: null, abnormal: false, apiRetryCount: 0, throttledMs: 0, rateLimited: false, networkMs: 0, parseMs: 0, dbWriteMs: 0, workerWaitMs: 0, featureMs: 0, healthQueryMs: 0 },
+  currentStage: "下載原始行情 → 正規化 → 驗證 → 批次寫入", nextStages: [],
   policy: { version: "pit-v2.2", targetStart: "2010-01-04", universe: "official_full_market_as_of_each_date", usesCurrentListings: false, featureAvailability: "next_calendar_day_00_taipei" },
 };
 
@@ -109,6 +149,17 @@ const dateTime = (value?: string | null) => {
   if (!value) return "尚未取得";
   return new Intl.DateTimeFormat("zh-TW", { timeZone: "Asia/Taipei", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(value));
 };
+const duration = (seconds: number | null) => {
+  if (seconds === null || !Number.isFinite(seconds)) return "計算中";
+  const total = Math.max(0, Math.round(seconds));
+  const days = Math.floor(total / 86_400);
+  const hours = Math.floor((total % 86_400) / 3_600);
+  const minutes = Math.floor((total % 3_600) / 60);
+  if (days) return `${days} 天 ${hours} 小時`;
+  if (hours) return `${hours} 小時 ${minutes} 分`;
+  return `${minutes} 分`;
+};
+const speed = (value: number) => `${value.toLocaleString("zh-TW", { maximumFractionDigits: value >= 100 ? 0 : 1 })} rows/s`;
 
 function BrandMark() {
   return <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>;
@@ -400,6 +451,8 @@ function Rules({ horizon, setHorizon, health, backfillWorking, backfillError, on
   const blocked = backfill?.status === "blocked_bias_violation";
   const finished = backfill?.status === "complete";
   const runnerActive = health.runner?.status === "running";
+  const perf = health.performance;
+  const checkpoint = health.runner?.checkpointStatus ?? (backfill?.lastCheckpointAt ? "saved" : "not_started");
   return <div className="stack enter">
     <section className="definition-card"><span className="section-kicker">核心界線</span><h2>官方證明現在，模型推論未來</h2><div className="definition-flow"><Definition no="01" title="官方事實" detail="價量、法人、營收、財報與事件" /><i>→</i><Definition no="02" title="模型推論" detail="學習歷史關係，輸出條件機率" /><i>→</i><Definition no="03" title="樣本外驗證" detail="未見資料、成本與機率校準" /></div></section>
     <section className="section-block backfill-card">
@@ -409,11 +462,22 @@ function Rules({ horizon, setHorizon, health, backfillWorking, backfillError, on
         <div><span className={survivorship?.blocked || survivorship?.violations ? "guard-bad" : "guard-ok"}>{survivorship?.blocked || survivorship?.violations ? "阻擋" : "硬規則"}</span><strong>1. 生存者偏差</strong><p>當日有出現在官方市場表的證券就保存；日後下市、下櫃也不刪除。現在的股票清單完全不參與歷史母體。</p><small>{survivorship ? `通過 ${survivorship.passed} 次 · 違規 ${survivorship.violations}` : "等待第一批官方資料稽核"}</small></div>
         <div><span className={lookahead?.blocked || lookahead?.violations ? "guard-bad" : "guard-ok"}>{lookahead?.blocked || lookahead?.violations ? "阻擋" : "硬規則"}</span><strong>2. 前視偏見</strong><p>盤後資料最早到下一日 00:00（台北時間）才能當特徵；官方回傳日期和請求日期不一致時整批拒收。</p><small>{lookahead ? `通過 ${lookahead.passed} 次 · 違規 ${lookahead.violations}` : "等待第一批官方資料稽核"}</small></div>
       </div>
-      <div className="backfill-progress"><div><span>實際回填進度</span><b>{backfill ? `${backfill.progress.toFixed(2)}%` : "0.00%"}</b></div><i><span style={{ width: `${backfill?.progress ?? 0}%` }} /></i><div className="backfill-meta"><span>{backfill ? `游標 ${backfill.cursorDate} · ${backfill.cursorMarket}` : "尚未建立工作"}</span><span>{backfill ? `${backfill.storedRows.toLocaleString("zh-TW")} 筆 · 缺口 ${backfill.openFailures}` : "0 筆"}</span></div></div>
-      <div className={`backfill-auto ${runnerActive ? "runner-active" : ""}`}><div><strong>伺服器背景回填</strong><span>{runnerActive ? "背景批次執行中，現在可以關閉網站" : "每小時自動接續；關閉網站不會中斷已啟動的批次"}</span></div><i className="runner-pulse" aria-hidden="true" /></div>
+      {perf.abnormal && <div className="backfill-warning"><strong>回填速度異常</strong><span>依最近速度估算，剩餘時間超過 24 小時。系統仍會從 checkpoint 續跑。</span></div>}
+      <div className="backfill-progress"><div><span>實際回填進度</span><b>{backfill ? `${backfill.progress.toFixed(2)}%` : "0.00%"}</b></div><i><span style={{ width: `${backfill?.progress ?? 0}%` }} /></i><div className="backfill-meta"><span>{backfill ? `${backfill.storedRows.toLocaleString("zh-TW")} / ${backfill.estimatedTotalRows.toLocaleString("zh-TW")} 筆（估）` : "0 / 計算中"}</span><span>{backfill ? `市場單位 ${backfill.processedUnits.toLocaleString("zh-TW")} / ${backfill.totalUnits.toLocaleString("zh-TW")}` : "尚未建立工作"}</span></div></div>
+      <div className="backfill-telemetry">
+        <div><span>當前交易日</span><b>{backfill?.cursorDate ?? "—"}</b><small>{backfill?.cursorMarket ?? "—"}</small></div>
+        <div><span>當前階段</span><b>原始行情</b><small>下載・正規化・驗證・寫入</small></div>
+        <div><span>最近速度</span><b>{speed(perf.recentRowsPerSecond)}</b><small>上一個伺服器批次</small></div>
+        <div><span>執行平均</span><b>{speed(perf.averageRowsPerSecond)}</b><small>只計背景運算時間</small></div>
+        <div><span>已執行</span><b>{duration(perf.activeRuntimeMs / 1_000)}</b><small>累計有效執行時間</small></div>
+        <div><span>ETA</span><b>{duration(perf.etaSeconds)}</b><small>依最近有效速度估算</small></div>
+        <div><span>API retry</span><b>{perf.apiRetryCount.toLocaleString("zh-TW")}</b><small>{perf.rateLimited ? "官方限流中" : "目前未限流"}</small></div>
+        <div><span>Checkpoint</span><b>{checkpoint === "saved" ? "已保存" : checkpoint === "writing" ? "寫入中" : checkpoint === "error" ? "異常" : "等待"}</b><small>{backfill?.lastCheckpointAt ? dateTime(backfill.lastCheckpointAt) : "尚未建立"}</small></div>
+      </div>
+      <div className={`backfill-auto ${runnerActive ? "runner-active" : ""}`}><div><strong>伺服器背景回填</strong><span>{runnerActive ? "背景批次執行中，現在可以關閉網站" : "每批完成即保存；重開 App 或重新啟動時從 checkpoint 接續"}</span></div><i className="runner-pulse" aria-hidden="true" /></div>
       <button className="backfill-button" onClick={onBackfill} disabled={backfillWorking || runnerActive || blocked || finished}>{backfillWorking ? "正在交給伺服器…" : runnerActive ? "背景批次執行中" : blocked ? "偏差稽核未通過，已停止" : finished ? "本輪回填完成" : backfill?.status === "complete_with_gaps" ? "背景重試下載缺口" : backfill ? "立即啟動下一批" : "開始 v2.2 背景回填"}</button>
       {backfillError && <p className="backfill-error">本次沒有寫入：{backfillError}</p>}
-      <p className="backfill-disclosure">每批最多安全推進 12 個市場日單位，另由每小時排程接續。每次寫入前都先跑兩項稽核；下載失敗會登記成缺口，不會當成休市日。</p>
+      <p className="backfill-disclosure">每批最多處理 18 個交易日、同日上市與上櫃最多 2 個受控 worker；同一交易日以單一 bulk transaction 寫入。下載失敗會重試並登記缺口，不會當成休市日，也不會重算 MA／RSI／MACD／KD、標籤或模型。</p>
     </section>
     <section className="section-block"><Heading eyebrow="三個週期" title="每個期限獨立判斷" /><HorizonTabs horizon={horizon} setHorizon={setHorizon} /><div className="metric-grid">{metrics.map(([name, detail]) => <div className="metric-definition" key={name}><span>—</span><strong>{name}</strong><p>{detail}</p><small>等待驗證</small></div>)}</div></section>
     <section className="section-block"><div className="section-heading-row"><Heading eyebrow="模型健康" title="能不能信，要看這裡" /><span className="health-pill">{health.modelRuns.length ? "已有測試" : "尚未評分"}</span></div><div className="health-list"><Health name="已保存官方歷史資料" value={`${health.historicalRows.toLocaleString("zh-TW")} 筆`} /><Health name="歷史曾出現證券" value={`${health.stockCount.toLocaleString("zh-TW")} 檔`} /><Health name="目前日期範圍" value={health.earliestDate && health.latestDate ? `${health.earliestDate}～${health.latestDate}` : "尚無資料"} /><Health name="未修復下載缺口" value={`${backfill?.openFailures ?? 0} 個市場日`} /><Health name="樣本外回測" value={health.modelRuns.length ? `${health.modelRuns.length} 組紀錄` : "尚未執行"} /><Health name="機率校準" value={health.modelRuns.some((run) => run.calibrationError !== null) ? "已有結果" : "尚未執行"} /></div><p className="health-disclosure">這裡直接讀取資料庫紀錄；0 筆就是 0 筆，不使用假進度。</p></section>

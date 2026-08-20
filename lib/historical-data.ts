@@ -31,8 +31,23 @@ type OfficialReport = {
   tables?: OfficialTable[];
 };
 
+type LegacyTpexReport = {
+  aaData?: unknown[];
+  date?: string;
+  reportDate?: string;
+};
+
+export type FetchProfile = {
+  networkMs: number;
+  parseMs: number;
+  retryCount: number;
+  throttledMs: number;
+  rateLimited: boolean;
+  attempts: number;
+};
+
 export const BACKFILL_POLICY = Object.freeze({
-  version: "pit-v2.2",
+  version: "pit-v2.2-bulk",
   targetStart: "2010-01-04",
   universe: "official_full_market_as_of_each_date",
   usesCurrentListings: false,
@@ -95,6 +110,17 @@ export function historicalSourceUrl(market: HistoricalMarket, tradingDate: strin
   }
   const params = new URLSearchParams({ date: tradingDate.replace(/-/g, "/"), id: "", response: "json" });
   return `https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes?${params.toString()}`;
+}
+
+export function historicalSourceUrls(market: HistoricalMarket, tradingDate: string) {
+  if (market === "上市") return [historicalSourceUrl(market, tradingDate)];
+  const rocYear = Number(tradingDate.slice(0, 4)) - 1911;
+  const rocDate = `${rocYear}/${tradingDate.slice(5, 7)}/${tradingDate.slice(8, 10)}`;
+  const legacy = new URL("https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php");
+  legacy.searchParams.set("l", "zh-tw");
+  legacy.searchParams.set("o", "json");
+  legacy.searchParams.set("d", rocDate);
+  return [historicalSourceUrl(market, tradingDate), legacy.toString()];
 }
 
 function rowCells(row: unknown, fields: string[]) {
@@ -165,6 +191,40 @@ export function parseHistoricalReport(report: OfficialReport, market: Historical
   return observations;
 }
 
+export function parseLegacyTpexReport(report: LegacyTpexReport, tradingDate: string, source: string) {
+  const observations: HistoricalObservation[] = [];
+  const seen = new Set<string>();
+  for (const rawRow of report.aaData ?? []) {
+    if (!Array.isArray(rawRow)) continue;
+    const code = cleanText(rawRow[0]);
+    const name = cleanText(rawRow[1]);
+    if (!code || !name || seen.has(code)) continue;
+    seen.add(code);
+    const close = numberValue(rawRow[2]);
+    const volume = numberValue(rawRow[8]);
+    const tradeValue = numberValue(rawRow[9]);
+    observations.push({
+      market: "上櫃",
+      code,
+      name,
+      tradingDate,
+      securityType: /^[1-9]\d{3}$/.test(code) ? "ordinary_equity_candidate" : "other_security",
+      universeStatus: close === null ? "present_no_quote" : "traded_or_quoted",
+      open: numberValue(rawRow[4]),
+      high: numberValue(rawRow[5]),
+      low: numberValue(rawRow[6]),
+      close,
+      change: numberValue(rawRow[3]),
+      volume: volume === null ? null : Math.round(volume),
+      tradeValue,
+      source,
+      sourceScope: "full_market_daily",
+      usableFrom: nextCalendarDayTaipei(tradingDate),
+    });
+  }
+  return observations;
+}
+
 export function auditBiasGuards(observations: HistoricalObservation[], tradingDate: string) {
   const survivorshipViolations = observations.filter((row) => row.sourceScope !== "full_market_daily").length;
   const lookAheadViolations = observations.filter((row) => row.tradingDate !== tradingDate || row.usableFrom.slice(0, 10) <= tradingDate).length;
@@ -182,26 +242,89 @@ export function auditBiasGuards(observations: HistoricalObservation[], tradingDa
   };
 }
 
+const hostLastRequest = new Map<string, number>();
+const FETCH_POLICY = Object.freeze({ timeoutMs: 8_000, maxAttempts: 3, hostSpacingMs: 350, backoffBaseMs: 400 });
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForHostSlot(source: string) {
+  const host = new URL(source).host;
+  const elapsed = Date.now() - (hostLastRequest.get(host) ?? 0);
+  const waitMs = Math.max(0, FETCH_POLICY.hostSpacingMs - elapsed);
+  if (waitMs) await delay(waitMs);
+  hostLastRequest.set(host, Date.now());
+  return waitMs;
+}
+
+function retryableStatus(status: number) {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
 export async function fetchHistoricalMarketDay(market: HistoricalMarket, tradingDate: string) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(tradingDate)) throw new Error("Invalid trading date");
-  const source = historicalSourceUrl(market, tradingDate);
-  const response = await fetch(source, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": "WallExplorerV2/2.2",
-      Referer: market === "上市"
-        ? "https://www.twse.com.tw/zh/trading/historical/mi-index.html"
-        : "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html",
-    },
-    signal: AbortSignal.timeout(9_000),
-    cache: "no-store",
-  });
-  if (!response.ok) throw new Error(`Official historical source returned ${response.status}`);
-  const report = await response.json() as OfficialReport;
-  const observations = parseHistoricalReport(report, market, tradingDate, source);
-  const officialDate = normalizeOfficialDate(report.date);
-  if (observations.length && officialDate && officialDate !== tradingDate) {
-    throw new Error(`Official date mismatch: requested ${tradingDate}, received ${officialDate}`);
+  const profile: FetchProfile = { networkMs: 0, parseMs: 0, retryCount: 0, throttledMs: 0, rateLimited: false, attempts: 0 };
+  const sources = historicalSourceUrls(market, tradingDate);
+  let lastError: Error | null = null;
+
+  for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex += 1) {
+    const source = sources[sourceIndex];
+    const attempts = sourceIndex === 0 && market === "上櫃" ? 1 : FETCH_POLICY.maxAttempts;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      profile.attempts += 1;
+      const throttled = await waitForHostSlot(source);
+      profile.throttledMs += throttled;
+      try {
+        const networkStarted = performance.now();
+        const response = await fetch(source, {
+          headers: {
+            Accept: "application/json",
+            "User-Agent": "WallExplorerV2/2.2-bulk",
+            Referer: market === "上市"
+              ? "https://www.twse.com.tw/zh/trading/historical/mi-index.html"
+              : "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html",
+          },
+          signal: AbortSignal.timeout(FETCH_POLICY.timeoutMs),
+          cache: "no-store",
+          redirect: "follow",
+        });
+        const body = await response.text();
+        profile.networkMs += performance.now() - networkStarted;
+        if (!response.ok) {
+          const error = new Error(`Official historical source returned ${response.status}`);
+          if (!retryableStatus(response.status)) throw error;
+          if (response.status === 429) profile.rateLimited = true;
+          throw error;
+        }
+
+        const parseStarted = performance.now();
+        const report = JSON.parse(body) as OfficialReport & LegacyTpexReport;
+        const observations = source.includes("stk_quote_result.php")
+          ? parseLegacyTpexReport(report, tradingDate, source)
+          : parseHistoricalReport(report, market, tradingDate, source);
+        profile.parseMs += performance.now() - parseStarted;
+        const officialDate = normalizeOfficialDate(report.date ?? report.reportDate);
+        if (observations.length && officialDate && officialDate !== tradingDate) {
+          throw new Error(`Official date mismatch: requested ${tradingDate}, received ${officialDate}`);
+        }
+        return {
+          source,
+          observations,
+          officialStatus: report.stat ?? null,
+          officialDate: officialDate ?? tradingDate,
+          profile,
+        };
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error("Unknown official source error");
+        const isLast = attempt + 1 >= attempts;
+        if (isLast) break;
+        profile.retryCount += 1;
+        const backoff = FETCH_POLICY.backoffBaseMs * 2 ** attempt + Math.floor(Math.random() * 150);
+        profile.throttledMs += backoff;
+        await delay(backoff);
+      }
+    }
   }
-  return { source, observations, officialStatus: report.stat ?? null, officialDate: officialDate ?? tradingDate };
+  throw Object.assign(lastError ?? new Error("Official historical source unavailable"), { fetchProfile: profile });
 }
