@@ -19,11 +19,23 @@ type Runner = {
   workerWaitMs: number; rateLimited: number; checkpointStatus: string;
 };
 
+function weekdayMarketUnits(start: string, end: string) {
+  let units = 0;
+  const cursor = new Date(`${start}T12:00:00Z`);
+  const finish = Date.parse(`${end}T12:00:00Z`);
+  while (cursor.getTime() <= finish) {
+    const day = cursor.getUTCDay();
+    if (day !== 0 && day !== 6) units += 2;
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return units;
+}
+
 function estimateTotalRows(job: BackfillJob) {
   const successfulUnits = Math.max(1, job.processedUnits - job.emptyUnits - job.failedUnits);
   const observedAverage = job.storedRows / successfulUnits;
   const blendedAverage = job.failedUnits > successfulUnits ? (observedAverage + 850) / 2 : observedAverage;
-  return Math.max(job.storedRows, Math.round(blendedAverage * job.totalUnits));
+  return Math.max(job.storedRows, Math.round(blendedAverage * weekdayMarketUnits(job.targetStart, job.targetEnd)));
 }
 
 export async function GET() {

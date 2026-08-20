@@ -109,6 +109,18 @@ function calendarDays(start: string, end: string) {
   return Math.floor((Date.parse(`${end}T00:00:00Z`) - Date.parse(`${start}T00:00:00Z`)) / 86_400_000) + 1;
 }
 
+function weekdayMarketUnits(start: string, end: string) {
+  let units = 0;
+  const cursor = new Date(`${start}T12:00:00Z`);
+  const finish = Date.parse(`${end}T12:00:00Z`);
+  while (cursor.getTime() <= finish) {
+    const day = cursor.getUTCDay();
+    if (day !== 0 && day !== 6) units += 2;
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return units;
+}
+
 function isWeekend(date: string) {
   const day = new Date(`${date}T12:00:00Z`).getUTCDay();
   return day === 0 || day === 6;
@@ -528,7 +540,7 @@ function estimateTotalRows(job: JobRow) {
   const successfulUnits = Math.max(1, job.processedUnits - job.emptyUnits - job.failedUnits);
   const observedAverage = job.storedRows / successfulUnits;
   const blendedAverage = job.failedUnits > successfulUnits ? (observedAverage + 850) / 2 : observedAverage;
-  return Math.max(job.storedRows, Math.round(blendedAverage * job.totalUnits));
+  return Math.max(job.storedRows, Math.round(blendedAverage * weekdayMarketUnits(job.targetStart, job.targetEnd)));
 }
 
 async function healthPayload() {
