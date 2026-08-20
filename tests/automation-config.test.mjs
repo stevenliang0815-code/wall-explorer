@@ -19,6 +19,12 @@ test("terminal jobs become scheduler no-ops", async () => {
   assert.match(route, /\["complete", "blocked_bias_violation"\]\.includes\(existingJob\.status\)/);
 });
 
+test("UI claims full automation only after a real scheduler heartbeat", async () => {
+  const page = await readFile("app/page.tsx", "utf8");
+  assert.match(page, /schedulerHealthy/);
+  assert.match(page, /未偵測到 scheduled 事件，不顯示假成功/);
+});
+
 test("migration enables automation without resetting backfill data", async () => {
   const migration = await readFile("drizzle/0004_chief_bug.sql", "utf8");
   assert.match(migration, /ADD `automation_enabled` integer DEFAULT 1 NOT NULL/);

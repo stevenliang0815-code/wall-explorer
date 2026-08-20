@@ -95,6 +95,7 @@ type ModelHealth = {
     schedulerLastTriggeredAt: string | null;
     schedulerNextExpectedAt: string | null;
     lastTriggerSource: string;
+    schedulerHealthy: boolean;
     lastError: string | null;
   };
   performance: {
@@ -456,7 +457,7 @@ function Rules({ horizon, setHorizon, health, backfillWorking, backfillError, on
   const blocked = backfill?.status === "blocked_bias_violation";
   const finished = backfill?.status === "complete";
   const runnerActive = health.runner?.status === "running";
-  const automatic = Boolean(health.runner?.automationEnabled);
+  const automatic = Boolean(health.runner?.schedulerHealthy);
   const perf = health.performance;
   const checkpoint = health.runner?.checkpointStatus ?? (backfill?.lastCheckpointAt ? "saved" : "not_started");
   return <div className="stack enter">
@@ -480,10 +481,10 @@ function Rules({ horizon, setHorizon, health, backfillWorking, backfillError, on
         <div><span>API retry</span><b>{perf.apiRetryCount.toLocaleString("zh-TW")}</b><small>{perf.rateLimited ? "官方限流中" : "目前未限流"}</small></div>
         <div><span>Checkpoint</span><b>{checkpoint === "saved" ? "已保存" : checkpoint === "writing" ? "寫入中" : checkpoint === "error" ? "異常" : "等待"}</b><small>{backfill?.lastCheckpointAt ? dateTime(backfill.lastCheckpointAt) : "尚未建立"}</small></div>
       </div>
-      <div className={`backfill-auto ${automatic || runnerActive ? "runner-active" : ""}`}><div><strong>{automatic ? "全自動伺服器回填" : "伺服器背景回填"}</strong><span>{runnerActive ? "批次執行中；現在可以關閉網站與手機" : automatic ? `排程已啟用，每 ${health.runner?.schedulerIntervalMinutes ?? 1} 分鐘自動接續；手機不必開著` : "每批完成即保存；重開 App 時從 checkpoint 接續"}</span><small>{automatic ? `上次排程 ${dateTime(health.runner?.schedulerLastTriggeredAt)} · 來源 ${health.runner?.lastTriggerSource === "scheduled" ? "自動" : "手動"}` : "尚未啟用自動排程"}</small></div><i className="runner-pulse" aria-hidden="true" /></div>
+      <div className={`backfill-auto ${automatic || runnerActive ? "runner-active" : ""}`}><div><strong>{automatic ? "全自動伺服器回填" : runnerActive ? "伺服器背景回填" : "自動排程尚未生效"}</strong><span>{runnerActive ? "本批執行中；現在可以關閉網站與手機" : automatic ? `排程健康，每 ${health.runner?.schedulerIntervalMinutes ?? 1} 分鐘自動接續；手機不必開著` : "目前平台沒有送出排程心跳；需要手動啟動批次，完成後仍會保存 checkpoint"}</span><small>{automatic ? `上次排程 ${dateTime(health.runner?.schedulerLastTriggeredAt)} · 來源 ${health.runner?.lastTriggerSource === "scheduled" ? "自動" : "手動"}` : "未偵測到 scheduled 事件，不顯示假成功"}</small></div><i className="runner-pulse" aria-hidden="true" /></div>
       <button className="backfill-button" onClick={onBackfill} disabled={backfillWorking || runnerActive || blocked || finished}>{backfillWorking ? "正在交給伺服器…" : runnerActive ? "背景批次執行中" : blocked ? "偏差稽核未通過，已停止" : finished ? "本輪回填完成" : backfill?.status === "complete_with_gaps" ? "背景重試下載缺口" : backfill ? "立即啟動下一批" : "開始 v2.2 背景回填"}</button>
       {backfillError && <p className="backfill-error">本次沒有寫入：{backfillError}</p>}
-      <p className="backfill-disclosure">伺服器每分鐘自動喚醒一次；每批最多處理 18 個交易日、同日上市與上櫃最多 2 個受控 worker。互斥鎖阻止重疊，完成、偏誤阻擋或已有執行中批次時自動跳過。下載失敗會登記缺口，不會當成休市日，也不會重算 MA／RSI／MACD／KD、標籤或模型。</p>
+      <p className="backfill-disclosure">排程處理器已準備，但只有收到真實 scheduled heartbeat 才會顯示全自動。每批最多處理 18 個交易日、同日上市與上櫃最多 2 個受控 worker；互斥鎖阻止重疊。下載失敗會登記缺口，不會當成休市日，也不會重算 MA／RSI／MACD／KD、標籤或模型。</p>
     </section>
     <section className="section-block"><Heading eyebrow="三個週期" title="每個期限獨立判斷" /><HorizonTabs horizon={horizon} setHorizon={setHorizon} /><div className="metric-grid">{metrics.map(([name, detail]) => <div className="metric-definition" key={name}><span>—</span><strong>{name}</strong><p>{detail}</p><small>等待驗證</small></div>)}</div></section>
     <section className="section-block"><div className="section-heading-row"><Heading eyebrow="模型健康" title="能不能信，要看這裡" /><span className="health-pill">{health.modelRuns.length ? "已有測試" : "尚未評分"}</span></div><div className="health-list"><Health name="已保存官方歷史資料" value={`${health.historicalRows.toLocaleString("zh-TW")} 筆`} /><Health name="歷史曾出現證券" value={`${health.stockCount.toLocaleString("zh-TW")} 檔`} /><Health name="目前日期範圍" value={health.earliestDate && health.latestDate ? `${health.earliestDate}～${health.latestDate}` : "尚無資料"} /><Health name="未修復下載缺口" value={`${backfill?.openFailures ?? 0} 個市場日`} /><Health name="樣本外回測" value={health.modelRuns.length ? `${health.modelRuns.length} 組紀錄` : "尚未執行"} /><Health name="機率校準" value={health.modelRuns.some((run) => run.calibrationError !== null) ? "已有結果" : "尚未執行"} /></div><p className="health-disclosure">這裡直接讀取資料庫紀錄；0 筆就是 0 筆，不使用假進度。</p></section>

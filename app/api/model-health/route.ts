@@ -19,7 +19,7 @@ type Runner = {
   workerWaitMs: number; rateLimited: number; checkpointStatus: string;
   automationEnabled: number; schedulerIntervalMinutes: number;
   schedulerLastTriggeredAt: string | null; schedulerNextExpectedAt: string | null;
-  lastTriggerSource: string;
+  lastTriggerSource: string; schedulerHealthy?: boolean;
 };
 
 function weekdayMarketUnits(start: string, end: string) {
@@ -94,6 +94,10 @@ export async function GET() {
     const recentRowsPerSecond = runner?.recentRowsPerSecond ?? 0;
     const etaRate = recentRowsPerSecond > 0 ? recentRowsPerSecond : averageRowsPerSecond;
     const etaSeconds = job && etaRate > 0 ? Math.max(0, (estimatedTotalRows - job.storedRows) / etaRate) : null;
+    const schedulerHealthy = Boolean(
+      runner?.schedulerLastTriggeredAt &&
+      Date.now() - Date.parse(runner.schedulerLastTriggeredAt) < 3 * 60_000,
+    );
     return Response.json({
       status: job?.status ?? "not_started",
       historicalRows: job?.storedRows ?? 0,
@@ -108,7 +112,7 @@ export async function GET() {
         openFailures: failures?.count ?? 0,
         audits: audits.results,
       } : null,
-      runner: runner ?? null,
+      runner: runner ? { ...runner, schedulerHealthy } : null,
       performance: {
         recentRowsPerSecond, averageRowsPerSecond, activeRuntimeMs, etaSeconds,
         abnormal: etaSeconds !== null && etaSeconds > 86_400,
