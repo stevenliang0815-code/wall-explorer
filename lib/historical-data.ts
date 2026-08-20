@@ -120,7 +120,9 @@ export function historicalSourceUrls(market: HistoricalMarket, tradingDate: stri
   legacy.searchParams.set("l", "zh-tw");
   legacy.searchParams.set("o", "json");
   legacy.searchParams.set("d", rocDate);
-  return [legacy.toString(), historicalSourceUrl(market, tradingDate)];
+  // Prefer the dated endpoint. The legacy URL can redirect and ignore its date,
+  // so it is retained only as a validated fallback.
+  return [historicalSourceUrl(market, tradingDate), legacy.toString()];
 }
 
 function rowCells(row: unknown, fields: string[]) {
@@ -242,8 +244,8 @@ export function auditBiasGuards(observations: HistoricalObservation[], tradingDa
   };
 }
 
-const hostLastRequest = new Map<string, number>();
-const FETCH_POLICY = Object.freeze({ timeoutMs: 8_000, maxAttempts: 3, hostSpacingMs: 350, backoffBaseMs: 400 });
+const hostNextRequestAt = new Map<string, number>();
+const FETCH_POLICY = Object.freeze({ twseTimeoutMs: 10_000, tpexTimeoutMs: 20_000, maxAttempts: 3, hostSpacingMs: 350, backoffBaseMs: 400 });
 
 function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -251,10 +253,11 @@ function delay(ms: number) {
 
 async function waitForHostSlot(source: string) {
   const host = new URL(source).host;
-  const elapsed = Date.now() - (hostLastRequest.get(host) ?? 0);
-  const waitMs = Math.max(0, FETCH_POLICY.hostSpacingMs - elapsed);
+  const now = Date.now();
+  const reservedAt = Math.max(now, hostNextRequestAt.get(host) ?? now);
+  hostNextRequestAt.set(host, reservedAt + FETCH_POLICY.hostSpacingMs);
+  const waitMs = Math.max(0, reservedAt - now);
   if (waitMs) await delay(waitMs);
-  hostLastRequest.set(host, Date.now());
   return waitMs;
 }
 
@@ -286,7 +289,7 @@ export async function fetchHistoricalMarketDay(market: HistoricalMarket, trading
               ? "https://www.twse.com.tw/zh/trading/historical/mi-index.html"
               : "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html",
           },
-          signal: AbortSignal.timeout(FETCH_POLICY.timeoutMs),
+          signal: AbortSignal.timeout(source.includes("tpex.org.tw") ? FETCH_POLICY.tpexTimeoutMs : FETCH_POLICY.twseTimeoutMs),
           cache: "no-store",
           redirect: "follow",
         });
@@ -302,9 +305,11 @@ export async function fetchHistoricalMarketDay(market: HistoricalMarket, trading
 
         const parseStarted = performance.now();
         const report = JSON.parse(body) as OfficialReport & LegacyTpexReport;
-        const observations = source.includes("stk_quote_result.php")
-          ? parseLegacyTpexReport(report, tradingDate, source)
-          : parseHistoricalReport(report, market, tradingDate, source);
+        const observations = Array.isArray(report.tables)
+          ? parseHistoricalReport(report, market, tradingDate, source)
+          : source.includes("stk_quote_result.php")
+            ? parseLegacyTpexReport(report, tradingDate, source)
+            : parseHistoricalReport(report, market, tradingDate, source);
         profile.parseMs += performance.now() - parseStarted;
         const officialDate = normalizeOfficialDate(report.date ?? report.reportDate);
         if (observations.length && officialDate && officialDate !== tradingDate) {

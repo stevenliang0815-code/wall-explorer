@@ -15,6 +15,7 @@ const start = args.get("--start") ?? BACKFILL_POLICY.targetStart;
 const end = args.get("--end") ?? new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
 const outputRoot = resolve(args.get("--output") ?? "snapshot-output");
 const chunkRows = Math.max(1_000, Number(args.get("--chunk-rows") ?? 10_000));
+const workers = Math.min(4, Math.max(1, Number(args.get("--workers") ?? 2)));
 const releaseName = `historical-${end}`;
 const workDir = join(outputRoot, `${releaseName}.building`);
 const releaseDir = join(outputRoot, releaseName);
@@ -68,6 +69,7 @@ const failure = db.prepare(`
   ON CONFLICT(market,trading_date) DO UPDATE SET status='failed',attempts=builder_checkpoints.attempts+1,last_error=excluded.last_error,updated_at=excluded.updated_at
 `);
 const completed = db.prepare("SELECT status FROM builder_checkpoints WHERE market=? AND trading_date=?");
+const completedDay = db.prepare("SELECT market,rows_written rowsWritten,status FROM builder_checkpoints WHERE trading_date=?");
 
 function isWeekend(date) {
   const day = new Date(`${date}T12:00:00Z`).getUTCDay();
@@ -93,19 +95,60 @@ function saveUnit(market, date, rows) {
   }
 }
 async function buildUnit(market, date) {
-  if (completed.get(market, date)?.status === "completed") return;
-  if (isWeekend(date)) return saveUnit(market, date, []);
+  if (completed.get(market, date)?.status === "completed") return null;
+  if (isWeekend(date)) { saveUnit(market, date, []); return null; }
   try {
     const result = await fetchHistoricalMarketDay(market, date);
     const audit = auditBiasGuards(result.observations, date);
     if (audit.survivorship.status !== "pass" || audit.lookAhead.status !== "pass") throw new Error("Bias validation blocked the official batch");
     saveUnit(market, date, result.observations);
+    return { rows: result.observations.length, profile: result.profile };
   } catch (error) {
     failure.run(market, date, error instanceof Error ? error.message.slice(0, 800) : "Unknown error", new Date().toISOString());
+    return null;
   }
 }
 
-for (const date of datesBetween(start, end)) await Promise.all(markets.map((market) => buildUnit(market, date)));
+const allDates = [...datesBetween(start, end)];
+const startedAt = Date.now();
+const runtime = { datesCompleted: 0, rowsWritten: 0, networkMs: 0, parseMs: 0, retries: 0, throttledMs: 0 };
+async function processDate(date) {
+  const results = await Promise.all(markets.map((market) => buildUnit(market, date)));
+  for (const result of results) {
+    if (!result) continue;
+    runtime.rowsWritten += result.rows;
+    runtime.networkMs += result.profile.networkMs;
+    runtime.parseMs += result.profile.parseMs;
+    runtime.retries += result.profile.retryCount;
+    runtime.throttledMs += result.profile.throttledMs;
+  }
+  const day = completedDay.all(date);
+  if (day.length === markets.length && day.every((unit) => unit.status === "completed")) {
+    const positive = day.filter((unit) => unit.rowsWritten > 0);
+    if (positive.length === 1) {
+      const empty = day.find((unit) => unit.rowsWritten === 0);
+      failure.run(empty.market, date, "Cross-market completeness gate: the other market has rows but this market is empty", new Date().toISOString());
+    }
+  }
+  runtime.datesCompleted += 1;
+  if (runtime.datesCompleted % 25 === 0 || runtime.datesCompleted === allDates.length) {
+    const elapsedSeconds = Math.max(0.001, (Date.now() - startedAt) / 1_000);
+    console.log(JSON.stringify({ status: "building", currentDate: date, datesCompleted: runtime.datesCompleted, totalDates: allDates.length,
+      percent: runtime.datesCompleted / allDates.length * 100, rowsWritten: runtime.rowsWritten,
+      rowsPerSecond: runtime.rowsWritten / elapsedSeconds, elapsedSeconds,
+      etaSeconds: elapsedSeconds / runtime.datesCompleted * (allDates.length - runtime.datesCompleted),
+      networkMs: runtime.networkMs, parseMs: runtime.parseMs, retries: runtime.retries, throttledMs: runtime.throttledMs, workers }));
+  }
+}
+
+let nextDateIndex = 0;
+await Promise.all(Array.from({ length: Math.min(workers, allDates.length) }, async () => {
+  while (nextDateIndex < allDates.length) {
+    const date = allDates[nextDateIndex];
+    nextDateIndex += 1;
+    await processDate(date);
+  }
+}));
 
 const openFailures = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status='failed'").get().count;
 const duplicates = db.prepare("SELECT count(*) count FROM (SELECT market,code,trading_date,count(*) n FROM historical_observations GROUP BY market,code,trading_date HAVING n>1)").get().count;

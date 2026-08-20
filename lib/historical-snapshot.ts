@@ -46,6 +46,11 @@ export function validateSnapshotManifest(value: unknown): HistoricalSnapshotMani
   }
   if (!manifest.cutoffDate || !/^\d{4}-\d{2}-\d{2}$/.test(manifest.cutoffDate)) throw new Error("Snapshot cutoff is invalid");
   if (!Number.isInteger(manifest.rowCount) || (manifest.rowCount ?? 0) <= 0) throw new Error("Snapshot row count is invalid");
+  const listed = manifest.markets?.上市;
+  const otc = manifest.markets?.上櫃;
+  if (!listed || !otc || listed.rows <= 0 || otc.rows <= 0 || listed.dates <= 0 || otc.dates <= 0 || listed.rows + otc.rows !== manifest.rowCount) {
+    throw new Error("Snapshot market coverage is incomplete");
+  }
   if (!Array.isArray(manifest.chunks) || !manifest.chunks.length) throw new Error("Snapshot has no import chunks");
   if (manifest.validation?.status !== "pass" || manifest.validation.openFailures !== 0 || manifest.validation.duplicates !== 0 || manifest.validation.survivorshipViolations !== 0 || manifest.validation.lookAheadViolations !== 0) {
     throw new Error("Snapshot validation gate did not pass");
@@ -54,6 +59,9 @@ export function validateSnapshotManifest(value: unknown): HistoricalSnapshotMani
     if (chunk.index !== index || !chunk.path || !Number.isInteger(chunk.rows) || chunk.rows <= 0 || !/^[a-f0-9]{64}$/.test(chunk.sha256)) {
       throw new Error(`Snapshot chunk ${index} is invalid`);
     }
+  }
+  if (manifest.chunks.reduce((sum, chunk) => sum + chunk.rows, 0) !== manifest.rowCount) {
+    throw new Error("Snapshot chunk totals do not match the manifest");
   }
   return manifest as HistoricalSnapshotManifest;
 }

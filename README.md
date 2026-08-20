@@ -108,11 +108,12 @@ Closing the Web App therefore cannot stop the rebuild.
 1. Build or resume the complete historical database on a server:
 
    ```bash
-   npm run snapshot:build -- --start 2010-01-04 --end 2026-08-19 --output ./snapshot-output
+   npm run snapshot:build -- --start 2010-01-04 --end 2026-08-19 --workers 2 --output ./snapshot-output
    ```
 
    The command preserves `builder.sqlite` and `builder_checkpoints`, fetches one
-   complete TWSE and TPEx market table per trading date, and publishes a release
+   complete TWSE and TPEx market table per trading date with at most four
+   rate-limited date workers, and publishes a release
    only after duplicate, survivorship, date-scope, and look-ahead audits pass.
    A successful release contains `historical.sqlite.gz`, compressed Web-import
    chunks, and `manifest.json` with SHA-256 checksums.
