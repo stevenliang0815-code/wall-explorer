@@ -48,5 +48,5 @@ test("legacy TPEx full-market fallback keeps delisted candidates and point-in-ti
   assert.equal(rows[1].change, -2);
   assert.equal(rows[1].usableFrom, "2020-01-03T00:00:00+08:00");
   assert.equal(auditBiasGuards(rows, "2020-01-02").lookAhead.status, "pass");
-  assert.match(historicalSourceUrls("上櫃", "2020-01-02")[1], /daily_close_quotes\/stk_quote_result\.php/);
+  assert.match(historicalSourceUrls("上櫃", "2020-01-02")[0], /daily_close_quotes\/stk_quote_result\.php/);
 });

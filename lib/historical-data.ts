@@ -120,7 +120,7 @@ export function historicalSourceUrls(market: HistoricalMarket, tradingDate: stri
   legacy.searchParams.set("l", "zh-tw");
   legacy.searchParams.set("o", "json");
   legacy.searchParams.set("d", rocDate);
-  return [historicalSourceUrl(market, tradingDate), legacy.toString()];
+  return [legacy.toString(), historicalSourceUrl(market, tradingDate)];
 }
 
 function rowCells(row: unknown, fields: string[]) {
@@ -270,13 +270,14 @@ export async function fetchHistoricalMarketDay(market: HistoricalMarket, trading
 
   for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex += 1) {
     const source = sources[sourceIndex];
-    const attempts = sourceIndex === 0 && market === "上櫃" ? 1 : FETCH_POLICY.maxAttempts;
+    const attempts = source.includes("/www/zh-tw/afterTrading/dailyQuotes") ? 1 : FETCH_POLICY.maxAttempts;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       profile.attempts += 1;
       const throttled = await waitForHostSlot(source);
       profile.throttledMs += throttled;
+      const networkStarted = performance.now();
+      let networkRecorded = false;
       try {
-        const networkStarted = performance.now();
         const response = await fetch(source, {
           headers: {
             Accept: "application/json",
@@ -291,6 +292,7 @@ export async function fetchHistoricalMarketDay(market: HistoricalMarket, trading
         });
         const body = await response.text();
         profile.networkMs += performance.now() - networkStarted;
+        networkRecorded = true;
         if (!response.ok) {
           const error = new Error(`Official historical source returned ${response.status}`);
           if (!retryableStatus(response.status)) throw error;
@@ -316,6 +318,7 @@ export async function fetchHistoricalMarketDay(market: HistoricalMarket, trading
           profile,
         };
       } catch (error) {
+        if (!networkRecorded) profile.networkMs += performance.now() - networkStarted;
         lastError = error instanceof Error ? error : new Error("Unknown official source error");
         const isLast = attempt + 1 >= attempts;
         if (isLast) break;
@@ -325,6 +328,7 @@ export async function fetchHistoricalMarketDay(market: HistoricalMarket, trading
         await delay(backoff);
       }
     }
+    if (sourceIndex + 1 < sources.length) profile.retryCount += 1;
   }
   throw Object.assign(lastError ?? new Error("Official historical source unavailable"), { fetchProfile: profile });
 }
