@@ -19,6 +19,12 @@ interface ExecutionContext {
   passThroughOnException(): void;
 }
 
+interface ScheduledController {
+  scheduledTime: number;
+  cron: string;
+  noRetry(): void;
+}
+
 // Image security config. SVG sources with .svg extension auto-skip the
 // optimization endpoint on the client side (served directly, no proxy).
 // To route SVGs through the optimizer (with security headers), set
@@ -41,6 +47,18 @@ const worker = {
     }
 
     return handler.fetch(request, env, ctx);
+  },
+
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    // Invoke the app route internally, so owner-only access controls do not
+    // block the schedule and no public scheduler credential is required.
+    const response = await handler.fetch(new Request("https://scheduled.internal/api/backfill", {
+      method: "POST",
+      headers: { "x-wall-backfill-trigger": "scheduled" },
+    }), env, ctx);
+    if (!response.ok && response.status !== 202) {
+      throw new Error(`Scheduled backfill returned HTTP ${response.status}`);
+    }
   },
 };
 

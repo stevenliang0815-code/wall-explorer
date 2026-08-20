@@ -96,6 +96,11 @@ export const backfillRunner = sqliteTable("backfill_runner", {
   workerWaitMs: integer("worker_wait_ms").notNull().default(0),
   rateLimited: integer("rate_limited").notNull().default(0),
   checkpointStatus: text("checkpoint_status").notNull().default("not_started"),
+  automationEnabled: integer("automation_enabled").notNull().default(1),
+  schedulerIntervalMinutes: integer("scheduler_interval_minutes").notNull().default(1),
+  schedulerLastTriggeredAt: text("scheduler_last_triggered_at"),
+  schedulerNextExpectedAt: text("scheduler_next_expected_at"),
+  lastTriggerSource: text("last_trigger_source").notNull().default("manual"),
   lastError: text("last_error"),
 });
 

@@ -248,6 +248,7 @@ a { color: inherit; }
 .backfill-auto > div { display: grid; gap: 4px; }
 .backfill-auto strong { font-size: 10px; }
 .backfill-auto span { color: var(--muted); font-size: 8px; line-height: 1.45; }
+.backfill-auto small { color: var(--muted-2); font-size: 7px; line-height: 1.4; }
 .backfill-auto .switch { flex: 0 0 46px; }
 .backfill-auto.runner-active { border-color: rgba(112,237,172,.28); background: rgba(112,237,172,.045); }
 .runner-pulse { flex: 0 0 11px; width: 11px; height: 11px; border-radius: 50%; background: rgba(143,158,151,.45); box-shadow: 0 0 0 6px rgba(143,158,151,.06); }

@@ -29,6 +29,13 @@
       "when": 1787215842476,
       "tag": "0003_premium_ego",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1787218464435,
+      "tag": "0004_chief_bug",
+      "breakpoints": true
     }
   ]
 }

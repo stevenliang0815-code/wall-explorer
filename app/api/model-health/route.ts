@@ -17,6 +17,9 @@ type Runner = {
   activeRuntimeMs: number; lastBatchRows: number; lastBatchDurationMs: number; recentRowsPerSecond: number;
   apiRetryCount: number; throttledMs: number; networkMs: number; parseMs: number; dbWriteMs: number;
   workerWaitMs: number; rateLimited: number; checkpointStatus: string;
+  automationEnabled: number; schedulerIntervalMinutes: number;
+  schedulerLastTriggeredAt: string | null; schedulerNextExpectedAt: string | null;
+  lastTriggerSource: string;
 };
 
 function weekdayMarketUnits(start: string, end: string) {
@@ -74,7 +77,12 @@ export async function GET() {
           api_retry_count AS apiRetryCount, throttled_ms AS throttledMs,
           network_ms AS networkMs, parse_ms AS parseMs, db_write_ms AS dbWriteMs,
           worker_wait_ms AS workerWaitMs, rate_limited AS rateLimited,
-          checkpoint_status AS checkpointStatus, last_error AS lastError
+          checkpoint_status AS checkpointStatus,
+          automation_enabled AS automationEnabled,
+          scheduler_interval_minutes AS schedulerIntervalMinutes,
+          scheduler_last_triggered_at AS schedulerLastTriggeredAt,
+          scheduler_next_expected_at AS schedulerNextExpectedAt,
+          last_trigger_source AS lastTriggerSource, last_error AS lastError
         FROM backfill_runner WHERE id = 1
       `).bind(new Date().toISOString()).first<Runner>(),
       d1.prepare("SELECT count(*) AS count, min(first_seen) AS earliestDate, max(last_seen) AS latestDate FROM historical_securities")

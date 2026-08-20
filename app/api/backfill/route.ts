@@ -53,6 +53,11 @@ type RunnerRow = {
   workerWaitMs: number;
   rateLimited: number;
   checkpointStatus: string;
+  automationEnabled: number;
+  schedulerIntervalMinutes: number;
+  schedulerLastTriggeredAt: string | null;
+  schedulerNextExpectedAt: string | null;
+  lastTriggerSource: string;
   lastError: string | null;
 };
 
@@ -81,7 +86,7 @@ type BatchProfile = {
 const SERVER_BATCH = Object.freeze({
   maxTradingDates: 18,
   maxRuntimeMs: 24_000,
-  leaseMs: 45_000,
+  leaseMs: 90_000,
   bulkTargetBytes: 700_000,
   workers: 2,
 });
@@ -170,7 +175,12 @@ async function runnerState() {
       api_retry_count AS apiRetryCount, throttled_ms AS throttledMs,
       network_ms AS networkMs, parse_ms AS parseMs, db_write_ms AS dbWriteMs,
       worker_wait_ms AS workerWaitMs, rate_limited AS rateLimited,
-      checkpoint_status AS checkpointStatus, last_error AS lastError
+      checkpoint_status AS checkpointStatus,
+      automation_enabled AS automationEnabled,
+      scheduler_interval_minutes AS schedulerIntervalMinutes,
+      scheduler_last_triggered_at AS schedulerLastTriggeredAt,
+      scheduler_next_expected_at AS schedulerNextExpectedAt,
+      last_trigger_source AS lastTriggerSource, last_error AS lastError
     FROM backfill_runner WHERE id = 1
   `).bind(new Date().toISOString()).first<RunnerRow>();
 }
@@ -183,19 +193,25 @@ async function ensureRunnerState() {
   `).run();
 }
 
-async function acquireRunnerLease(token: string) {
+async function acquireRunnerLease(token: string, triggerSource: "scheduled" | "manual") {
   const d1 = await getRawDb();
   await ensureRunnerState();
   const now = new Date();
   const nowIso = now.toISOString();
   const leaseUntil = new Date(now.getTime() + SERVER_BATCH.leaseMs).toISOString();
+  const nextExpectedAt = triggerSource === "scheduled" ? new Date(now.getTime() + 60_000).toISOString() : null;
   const result = await d1.prepare(`
     UPDATE backfill_runner SET
       status = 'running', lease_token = ?, lease_until = ?,
       last_started_at = ?, last_heartbeat_at = ?, last_error = NULL,
-      checkpoint_status = 'writing'
+      checkpoint_status = 'writing', last_trigger_source = ?,
+      scheduler_last_triggered_at = CASE WHEN ? = 'scheduled' THEN ? ELSE scheduler_last_triggered_at END,
+      scheduler_next_expected_at = CASE WHEN ? = 'scheduled' THEN ? ELSE scheduler_next_expected_at END
     WHERE id = 1 AND (status != 'running' OR lease_until IS NULL OR lease_until < ?)
-  `).bind(token, leaseUntil, nowIso, nowIso, nowIso).run();
+  `).bind(
+    token, leaseUntil, nowIso, nowIso, triggerSource,
+    triggerSource, nowIso, triggerSource, nextExpectedAt, nowIso,
+  ).run();
   return (result.meta.changes ?? 0) > 0;
 }
 
@@ -496,9 +512,11 @@ async function finishBatch(token: string, batchId: string, startedAtMs: number, 
   ]);
 }
 
-async function runServerBatch(maxTradingDates = SERVER_BATCH.maxTradingDates) {
+async function runServerBatch(maxTradingDates = SERVER_BATCH.maxTradingDates, triggerSource: "scheduled" | "manual" = "manual") {
+  const existingJob = await latestJob();
+  if (existingJob && ["complete", "blocked_bias_violation"].includes(existingJob.status)) return;
   const token = globalThis.crypto.randomUUID();
-  if (!(await acquireRunnerLease(token))) return;
+  if (!(await acquireRunnerLease(token, triggerSource))) return;
   const batchId = globalThis.crypto.randomUUID();
   const startedAt = new Date().toISOString();
   const startedAtMs = performance.now();
@@ -596,14 +614,19 @@ export async function GET() {
   }
 }
 
-export async function POST() {
+export async function POST(request: Request) {
   try {
+    const scheduled = request.headers.get("x-wall-backfill-trigger") === "scheduled";
+    if (scheduled) {
+      await runServerBatch(SERVER_BATCH.maxTradingDates, "scheduled");
+      return Response.json({ accepted: true, mode: "scheduled", ...(await healthPayload()) }, { status: 202, headers: { "Cache-Control": "no-store" } });
+    }
     const executionContext = getRequestExecutionContext();
     if (executionContext) {
-      executionContext.waitUntil(runServerBatch());
+      executionContext.waitUntil(runServerBatch(SERVER_BATCH.maxTradingDates, "manual"));
       return Response.json({ accepted: true, mode: "server_background", ...(await healthPayload()) }, { status: 202, headers: { "Cache-Control": "no-store" } });
     }
-    await runServerBatch(1);
+    await runServerBatch(1, "manual");
     return Response.json({ accepted: true, mode: "server_foreground_fallback", ...(await healthPayload()) }, { headers: { "Cache-Control": "no-store" } });
   } catch {
     return Response.json({ status: "unavailable", error: "回填資料庫尚未就緒，這次沒有寫入任何資料", policy: BACKFILL_POLICY }, { status: 503 });
