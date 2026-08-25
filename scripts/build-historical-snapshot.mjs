@@ -16,13 +16,20 @@ const end = args.get("--end") ?? new Date(Date.now() - 86_400_000).toISOString()
 const outputRoot = resolve(args.get("--output") ?? "snapshot-output");
 const chunkRows = Math.max(1_000, Number(args.get("--chunk-rows") ?? 10_000));
 const workers = Math.min(4, Math.max(1, Number(args.get("--workers") ?? 2)));
-const releaseName = `historical-${end}`;
+const maxDates = Math.max(1, Number(args.get("--max-dates") ?? Number.MAX_SAFE_INTEGER));
+const continuationRows = Math.max(0, Number(args.get("--continuation-rows") ?? 0));
+const continuationUnits = Math.max(0, Number(args.get("--continuation-units") ?? 0));
+const continuationCursor = args.get("--continuation-cursor") ?? null;
+const snapshotCutoff = args.get("--snapshot-cutoff") ?? end;
+const declaredTotalUnits = Math.max(0, Number(args.get("--total-units") ?? 0));
+const releaseName = `historical-${snapshotCutoff}`;
 const workDir = join(outputRoot, `${releaseName}.building`);
 const releaseDir = join(outputRoot, releaseName);
 const dbPath = join(workDir, "historical.sqlite");
+const statusPath = join(outputRoot, "job-status.json");
 const markets = ["上市", "上櫃"];
 
-if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end) || start > end) throw new Error("Invalid --start/--end range");
+if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end) || !/^\d{4}-\d{2}-\d{2}$/.test(snapshotCutoff) || start > end || end > snapshotCutoff) throw new Error("Invalid --start/--end/--snapshot-cutoff range");
 await mkdir(workDir, { recursive: true });
 await mkdir(join(workDir, "chunks"), { recursive: true });
 
@@ -71,6 +78,29 @@ const failure = db.prepare(`
 const completed = db.prepare("SELECT status FROM builder_checkpoints WHERE market=? AND trading_date=?");
 const completedDay = db.prepare("SELECT market,rows_written rowsWritten,status FROM builder_checkpoints WHERE trading_date=?");
 
+async function writeJobStatus(status, currentDate = null, lastError = null) {
+  const counts = db.prepare(`SELECT
+    sum(CASE WHEN status='completed' THEN 1 ELSE 0 END) completedUnits,
+    sum(CASE WHEN status='failed' THEN 1 ELSE 0 END) failedUnits,
+    coalesce(sum(CASE WHEN status='completed' THEN rows_written ELSE 0 END),0) rowsWritten
+    FROM builder_checkpoints`).get();
+  const segmentTotalUnits = allDates.length * markets.length;
+  const completedUnits = Number(counts.completedUnits ?? 0);
+  const totalUnits = declaredTotalUnits || continuationUnits + segmentTotalUnits;
+  const overallCompletedUnits = Math.min(totalUnits, continuationUnits + completedUnits);
+  const body = {
+    job: "historical-snapshot", status, updatedAt: new Date().toISOString(), currentDate,
+    range: { start, end }, snapshotCutoff, continuationCursor,
+    continuationRows, continuationUnits, segmentRows: Number(counts.rowsWritten ?? 0),
+    storedRows: continuationRows + Number(counts.rowsWritten ?? 0), completedUnits,
+    segmentTotalUnits, overallCompletedUnits, totalUnits,
+    progress: Number((overallCompletedUnits / Math.max(1, totalUnits) * 100).toFixed(2)),
+    failedUnits: Number(counts.failedUnits ?? 0), lastError,
+  };
+  await writeFile(statusPath, `${JSON.stringify(body, null, 2)}\n`);
+  return body;
+}
+
 function isWeekend(date) {
   const day = new Date(`${date}T12:00:00Z`).getUTCDay();
   return day === 0 || day === 6;
@@ -110,6 +140,8 @@ async function buildUnit(market, date) {
 }
 
 const allDates = [...datesBetween(start, end)];
+const pendingDates = allDates.filter((date) => markets.some((market) => completed.get(market, date)?.status !== "completed"));
+const batchDates = pendingDates.slice(0, maxDates);
 const startedAt = Date.now();
 const runtime = { datesCompleted: 0, rowsWritten: 0, networkMs: 0, parseMs: 0, retries: 0, throttledMs: 0 };
 async function processDate(date) {
@@ -142,13 +174,24 @@ async function processDate(date) {
 }
 
 let nextDateIndex = 0;
-await Promise.all(Array.from({ length: Math.min(workers, allDates.length) }, async () => {
-  while (nextDateIndex < allDates.length) {
-    const date = allDates[nextDateIndex];
+await Promise.all(Array.from({ length: Math.min(workers, batchDates.length) }, async () => {
+  while (nextDateIndex < batchDates.length) {
+    const date = batchDates[nextDateIndex];
     nextDateIndex += 1;
     await processDate(date);
   }
 }));
+
+const remainingUnits = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status!='completed'").get().count
+  + allDates.reduce((sum, date) => sum + markets.filter((market) => !completed.get(market, date)).length, 0);
+const completedUnits = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status='completed'").get().count;
+if (completedUnits < allDates.length * markets.length) {
+  db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  const state = await writeJobStatus(remainingUnits > 0 ? "retrying" : "running", batchDates.at(-1) ?? null);
+  db.close();
+  console.log(JSON.stringify(state));
+  process.exit(0);
+}
 
 const openFailures = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status='failed'").get().count;
 const duplicates = db.prepare("SELECT count(*) count FROM (SELECT market,code,trading_date,count(*) n FROM historical_observations GROUP BY market,code,trading_date HAVING n>1)").get().count;
@@ -189,6 +232,7 @@ while (true) {
   chunks.push({ index: chunkIndex, path: `chunks/${name}`, rows: payload.length, bytes: compressed.byteLength, sha256: createHash("sha256").update(compressed).digest("hex"), encoding: "gzip", contentType: "application/json" });
   chunkIndex += 1;
 }
+const finalStatus = await writeJobStatus("publishing", end);
 db.close();
 
 const sqliteGzipPath = join(workDir, "historical.sqlite.gz");
@@ -201,15 +245,25 @@ async function sha256File(path) {
 const sqliteInfo = await stat(sqliteGzipPath);
 const manifest = {
   format: SNAPSHOT_FORMAT, schemaVersion: SNAPSHOT_SCHEMA_VERSION,
-  snapshotVersion: `${end}-v1`, generatedAt: new Date().toISOString(), cutoffDate: end,
+  snapshotVersion: `${snapshotCutoff}-v1`, generatedAt: new Date().toISOString(), cutoffDate: snapshotCutoff,
   range: { start, end }, rowCount, securityCount, markets: marketStats,
   sqlite: { path: basename(sqliteGzipPath), bytes: sqliteInfo.size, sha256: await sha256File(sqliteGzipPath), encoding: "gzip" },
   chunks,
   validation: { status: "pass", openFailures: 0, duplicates: 0, survivorshipViolations: 0, lookAheadViolations: 0 },
+  mergeStrategy: "upsert",
+  continuation: continuationCursor ? { source: "sites-d1", cursorDate: continuationCursor, storedRows: continuationRows, processedUnits: continuationUnits } : null,
   sources: ["https://www.twse.com.tw/zh/trading/historical/mi-index.html", "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html"],
 };
 await writeFile(join(workDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 await rm(releaseDir, { recursive: true, force: true });
 await rename(workDir, releaseDir);
 const check = JSON.parse(await readFile(join(releaseDir, "manifest.json"), "utf8"));
+await writeFile(statusPath, `${JSON.stringify({
+  ...finalStatus,
+  status: "complete",
+  updatedAt: new Date().toISOString(),
+  snapshotVersion: check.snapshotVersion,
+  manifestPath: `snapshots/${check.snapshotVersion}/manifest.json`,
+  releaseDir,
+}, null, 2)}\n`);
 console.log(JSON.stringify({ status: "complete", releaseDir, snapshotVersion: check.snapshotVersion, rows: check.rowCount, chunks: check.chunks.length, sqliteBytes: check.sqlite.bytes }));

@@ -38,6 +38,37 @@ test("snapshot builder is an independent resumable SQLite job", async () => {
   assert.match(builder, /builder_checkpoints/);
   assert.match(builder, /historical\.sqlite\.gz/);
   assert.match(builder, /manifest\.json/);
+  assert.match(builder, /--max-dates/);
+  assert.match(builder, /continuationRows/);
+  assert.match(builder, /job-status\.json/);
+});
+
+test("GitHub Actions persists every historical batch to R2 and resumes before rebuilding", async () => {
+  const workflow = await readFile(".github/workflows/historical-backfill.yml", "utf8");
+  const restore = workflow.indexOf("r2-snapshot-store.sh restore");
+  const build = workflow.indexOf("build-historical-snapshot.mjs");
+  const checkpoint = workflow.indexOf("r2-snapshot-store.sh checkpoint");
+  assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /R2_ACCESS_KEY_ID: \$\{\{ secrets\.R2_ACCESS_KEY_ID \}\}/);
+  assert.ok(restore >= 0 && restore < build, "R2 checkpoint must restore before the builder starts");
+  assert.ok(checkpoint > build, "R2 checkpoint must upload after each builder batch");
+  assert.match(workflow, /if: failure\(\)/);
+  assert.doesNotMatch(workflow, /actions\/upload-artifact/);
+});
+
+test("daily GitHub Action updates both markets through the server API", async () => {
+  const workflow = await readFile(".github/workflows/daily-incremental.yml", "utf8");
+  assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /cron: "5 9 \* \* 1-5"/);
+  assert.match(workflow, /npm run incremental:run/);
+});
+
+test("PWA cloud job endpoint exposes status and GitHub start or retry controls", async () => {
+  const route = await readFile("app/api/cloud-job/route.ts", "utf8");
+  const page = await readFile("app/page.tsx", "utf8");
+  assert.match(route, /HISTORICAL_JOB_STATUS_URL/);
+  assert.match(route, /historical-backfill\.yml/);
+  assert.match(page, /GitHub Actions 雲端 Snapshot Job/);
 });
 
 test("daily incremental has an external server runner", async () => {

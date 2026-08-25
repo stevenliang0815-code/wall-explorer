@@ -16,6 +16,9 @@
     "db:generate": "bash scripts/sites-env.sh -- drizzle-kit generate",
     "snapshot:build": "node --experimental-strip-types scripts/build-historical-snapshot.mjs",
     "snapshot:bootstrap": "node scripts/bootstrap-webapp-snapshot.mjs",
+    "snapshot:r2:restore": "bash scripts/r2-snapshot-store.sh restore",
+    "snapshot:r2:checkpoint": "bash scripts/r2-snapshot-store.sh checkpoint",
+    "snapshot:r2:publish": "bash scripts/r2-snapshot-store.sh publish",
     "incremental:run": "node scripts/run-daily-incremental.mjs"
   },
   "dependencies": {

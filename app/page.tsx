@@ -38,6 +38,17 @@ type CandidateResponse = {
   candidates: DailyCandidate[];
   disclosure: string;
 };
+type CloudJob = {
+  configured: boolean;
+  status: string;
+  progress?: number;
+  storedRows?: number;
+  currentDate?: string | null;
+  updatedAt?: string;
+  failedUnits?: number;
+  startUrl: string;
+  retryUrl: string;
+};
 type ModelHealth = {
   status: string;
   historicalRows: number;
@@ -205,9 +216,22 @@ export default function Home() {
   const [candidateData, setCandidateData] = useState<CandidateResponse | null>(null);
   const [candidateLoading, setCandidateLoading] = useState(true);
   const [modelHealth, setModelHealth] = useState<ModelHealth>(emptyHealth);
+  const [cloudJob, setCloudJob] = useState<CloudJob | null>(null);
   const [backfillWorking, setBackfillWorking] = useState(false);
   const [backfillError, setBackfillError] = useState("");
   const ownerKey = useRef("");
+
+  useEffect(() => {
+    const refresh = async () => {
+      try {
+        const response = await fetch("/api/cloud-job", { cache: "no-store" });
+        setCloudJob(await response.json() as CloudJob);
+      } catch { /* Keep the last durable cloud status. */ }
+    };
+    void refresh();
+    const timer = window.setInterval(() => { void refresh(); }, 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     fetch("/api/market", { cache: "no-store" })
@@ -356,7 +380,7 @@ export default function Home() {
         {tab === "market" && <MarketSearch query={query} setQuery={setQuery} onSearch={searchStocks} searching={searching} submitted={submittedQuery} stocks={stocks} onSelect={setSelectedStock} />}
         {tab === "events" && <Events />}
         {tab === "explore" && <Explore candidates={candidateData} candidateLoading={candidateLoading} onSelect={setSelectedStock} />}
-        {tab === "rules" && <Rules horizon={horizon} setHorizon={setHorizon} health={modelHealth} backfillWorking={backfillWorking} backfillError={backfillError} onBackfill={runBackfill} />}
+        {tab === "rules" && <Rules horizon={horizon} setHorizon={setHorizon} health={modelHealth} cloudJob={cloudJob} backfillWorking={backfillWorking} backfillError={backfillError} onBackfill={runBackfill} />}
         {tab === "settings" && <Settings reducedMotion={reducedMotion} setReducedMotion={setReducedMotion} />}
       </main>
 
@@ -461,7 +485,7 @@ function Explore({ candidates, candidateLoading, onSelect }: { candidates: Candi
 }
 function Gate({ state, name, value }: { state: "work" | "lock"; name: string; value: string }) { return <div><Dot state={state} /><span>{name}</span><b>{value}</b></div>; }
 
-function Rules({ horizon, setHorizon, health, backfillWorking, backfillError, onBackfill }: { horizon: Horizon; setHorizon: (value: Horizon) => void; health: ModelHealth; backfillWorking: boolean; backfillError: string; onBackfill: () => void }) {
+function Rules({ horizon, setHorizon, health, cloudJob, backfillWorking, backfillError, onBackfill }: { horizon: Horizon; setHorizon: (value: Horizon) => void; health: ModelHealth; cloudJob: CloudJob | null; backfillWorking: boolean; backfillError: string; onBackfill: () => void }) {
   const metrics = [["上漲機率", `未來 ${horizon} 日報酬大於 0 的校準機率`], ["超額報酬", "股票報酬減去對應市場指數報酬"], ["風險回落", "95% 風險情境的期間內可能回落"], ["不確定程度", "模型分歧、資料缺口與校準誤差"]];
   const backfill = health.backfill;
   const survivorship = backfill?.audits.find((audit) => audit.auditType === "survivorship");
@@ -497,6 +521,8 @@ function Rules({ horizon, setHorizon, health, backfillWorking, backfillError, on
         <div><span>Checkpoint</span><b>{checkpoint === "saved" ? "已保存" : checkpoint === "writing" ? "寫入中" : checkpoint === "error" ? "異常" : "等待"}</b><small>{backfill?.lastCheckpointAt ? dateTime(backfill.lastCheckpointAt) : "尚未建立"}</small></div>
       </div>
       <div className={`backfill-auto ${runnerActive ? "runner-active" : ""}`}><div><strong>完整重建備援</strong><span>{runnerActive ? "伺服器批次執行中；關閉網站不影響本批" : "逐日官方重建與checkpoint仍保留，但不再由瀏覽器自動啟動"}</span><small>{automatic ? `偵測到排程心跳 ${dateTime(health.runner?.schedulerLastTriggeredAt)}` : "Web Worker／Service Worker／Wake Lock都不是必要條件"}</small></div><i className="runner-pulse" aria-hidden="true" /></div>
+      <div className="cloud-job-card"><div><strong>GitHub Actions 雲端 Snapshot Job</strong><span>{cloudJob?.configured ? `${cloudJob.status} · ${(cloudJob.progress ?? 0).toFixed(2)}% · ${(cloudJob.storedRows ?? 152052).toLocaleString("zh-TW")} 筆` : "等待 Cloudflare R2 與 GitHub Secrets 設定"}</span><small>{cloudJob?.updatedAt ? `最近更新 ${dateTime(cloudJob.updatedAt)} · 游標 ${cloudJob.currentDate ?? "—"}` : "手機關閉後仍由 GitHub Actions 執行；每批將 checkpoint 寫入 R2"}</small></div><b>{cloudJob?.status === "complete" ? "READY" : cloudJob?.configured ? "CLOUD" : "SETUP"}</b></div>
+      <a className="backfill-button cloud-action" href={cloudJob?.startUrl ?? "https://github.com/stevenliang0815-code/wall-explorer/actions/workflows/historical-backfill.yml"} target="_blank" rel="noreferrer">{cloudJob?.status === "retrying" ? "開啟 GitHub Actions 重試／續跑" : "開啟 GitHub Actions 啟動 Snapshot Job"}</a>
       <button className="backfill-button" onClick={onBackfill} disabled={backfillWorking || runnerActive || blocked || finished}>{backfillWorking ? "正在交給伺服器…" : runnerActive ? "完整重建批次執行中" : blocked ? "偏差稽核未通過，已停止" : finished ? "完整重建已完成" : backfill?.status === "complete_with_gaps" ? "重試完整重建缺口" : "手動執行一批完整重建（備援）"}</button>
       {backfillError && <p className="backfill-error">本次沒有寫入：{backfillError}</p>}
       <p className="backfill-disclosure">獨立Snapshot Builder以官方逐日全市場資料產生壓縮SQLite、分塊匯入檔與SHA-256 manifest；伺服器匯入支援chunk checkpoint及UPSERT。Snapshot完成後只走每日增量；下載失敗不會當成休市日，也不會在原始回填階段計算特徵、標籤或模型。</p>

@@ -154,3 +154,41 @@ The timeout defaults can be overridden for a controlled canary with `SITES_INSTA
 
 - [vinext Documentation](https://github.com/cloudflare/vinext)
 - [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+
+## GitHub Actions + Cloudflare R2
+
+The existing Sites UI and D1 database remain in place. GitHub Actions owns the
+long historical Builder and the weekday incremental trigger; R2 is the durable
+store for builder checkpoints, released snapshots, manifests, and checksums.
+No browser, Service Worker, phone, or personal computer is part of the Builder
+lifecycle.
+
+The preserved Sites/D1 continuation point is `152,052` rows with the next
+historical cursor at `2025-12-28` (`464 / 12,140` market units). The Action
+builds the missing `2010-01-04..2025-12-28` segment and imports it with UPSERT,
+so the existing recent rows are not deleted or reset.
+
+Required GitHub Actions secrets:
+
+- `R2_ACCOUNT_ID`
+- `R2_ACCESS_KEY_ID`
+- `R2_SECRET_ACCESS_KEY`
+- `R2_BUCKET`
+- `OAI_SITES_AUTHORIZATION`
+
+Required GitHub Actions variables:
+
+- `R2_PUBLIC_BASE_URL`
+- `WALL_EXPLORER_URL`
+
+Required Sites runtime variables after R2 public read access is configured:
+
+- `HISTORICAL_JOB_STATUS_URL=<R2_PUBLIC_BASE_URL>/jobs/historical/status.json`
+- `HISTORICAL_SNAPSHOT_MANIFEST_URL=<R2_PUBLIC_BASE_URL>/snapshots/latest/manifest.json`
+
+`Historical Snapshot Backfill` supports manual start and retry. It restores the
+SQLite checkpoint from R2, runs bounded batches, and uploads the database plus
+its SHA-256 and status JSON after every batch. A failed or timed-out Action can
+therefore be dispatched again without starting over. `Daily TWSE and TPEx
+Incremental Update` remains blocked by the Web API until the Snapshot import is
+complete.

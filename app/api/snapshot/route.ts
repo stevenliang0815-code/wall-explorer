@@ -127,7 +127,10 @@ export async function POST() {
     if (finished) {
       const actual = await d1.prepare("SELECT count(*) count FROM historical_observations WHERE trading_date<=?").bind(manifest.cutoffDate).first<{ count: number }>();
       if ((actual?.count ?? 0) < manifest.rowCount) throw new Error("Imported snapshot did not reach its validated row count");
-      await d1.prepare("UPDATE backfill_jobs SET status='complete',phase='daily_incremental',updated_at=?,completed_at=coalesce(completed_at,?) WHERE id=(SELECT max(id) FROM backfill_jobs)").bind(now,now).run();
+      await d1.prepare(`UPDATE backfill_jobs SET status='complete',phase='daily_incremental',
+        stored_rows=?,processed_units=total_units,cursor_date=target_start,cursor_market='上市',
+        failed_units=0,updated_at=?,completed_at=coalesce(completed_at,?)
+        WHERE id=(SELECT max(id) FROM backfill_jobs)`).bind(actual?.count ?? manifest.rowCount,now,now).run();
     }
     return Response.json({ ...(await currentImport()), mode: "snapshot_first" }, { status: finished ? 200 : 202, headers: { "Cache-Control": "no-store" } });
   } catch (error) {
