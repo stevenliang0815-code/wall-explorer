@@ -14,11 +14,11 @@ on:
       batch_dates:
         description: Calendar dates per durable checkpoint batch
         required: true
-        default: "25"
+        default: "2"
       max_cycles:
         description: Checkpoint batches in this run; 0 uses the full server window
         required: true
-        default: "0"
+        default: "1"
   schedule:
     - cron: "17 * * * *"
 
