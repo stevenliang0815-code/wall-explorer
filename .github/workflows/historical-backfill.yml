@@ -44,6 +44,7 @@ jobs:
       OAI_SITES_AUTHORIZATION: ${{ secrets.OAI_SITES_AUTHORIZATION }}
       SNAPSHOT_OUTPUT_ROOT: snapshot-output
       SNAPSHOT_VERSION: 2026-08-17-v1
+      R2_STORAGE_LIMIT_BYTES: "8589934592"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -90,6 +91,13 @@ jobs:
               --max-dates "$BATCH_DATES" \
               --output "$SNAPSHOT_OUTPUT_ROOT"
             bash scripts/r2-snapshot-store.sh checkpoint
+            usage_bytes=$(bash scripts/r2-snapshot-store.sh usage-bytes)
+            echo "R2 bucket usage: $usage_bytes / $R2_STORAGE_LIMIT_BYTES bytes"
+            if [ "$usage_bytes" -gt "$R2_STORAGE_LIMIT_BYTES" ]; then
+              echo "::warning::R2 usage exceeded the 8 GiB safety limit; stopping after the durable checkpoint."
+              echo "complete=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             state=$(node -e "const s=require('./snapshot-output/job-status.json'); process.stdout.write(s.status)")
             if [ "$state" = "complete" ]; then
               echo "complete=true" >> "$GITHUB_OUTPUT"
