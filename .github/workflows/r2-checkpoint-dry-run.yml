@@ -1,0 +1,68 @@
+name: R2 Checkpoint 25 GB Dry Run
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/r2-checkpoint-dry-run.yml"
+      - ".github/workflows/historical-backfill.yml"
+      - "scripts/r2-snapshot-store.sh"
+  push:
+    paths:
+      - ".github/workflows/r2-checkpoint-dry-run.yml"
+      - ".github/workflows/historical-backfill.yml"
+      - "scripts/r2-snapshot-store.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wall-explorer-r2-checkpoint-dry-run
+  cancel-in-progress: true
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+      R2_STORAGE_LIMIT_BYTES: "25000000000"
+      R2_NEXT_BATCH_RESERVE_BYTES: "100000000"
+      AWS_MAX_ATTEMPTS: "3"
+      AWS_RETRY_MODE: standard
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate required configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
+            if [ -z "${!key:-}" ]; then
+              echo "Required GitHub secret is missing: $key" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install S3-compatible client
+        run: python3 -m pip install --disable-pip-version-check awscli
+
+      - name: Read-only inventory and checkpoint projection
+        shell: bash
+        run: |
+          set -euo pipefail
+          output=$(bash scripts/r2-snapshot-store.sh checkpoint-preflight)
+          printf '%s\n' "$output"
+          {
+            echo "## 25 GB checkpoint dry-run"
+            echo
+            echo '```text'
+            printf '%s\n' "$output"
+            echo '```'
+            echo
+            echo "No R2 object was uploaded, copied, replaced, or deleted."
+          } >> "$GITHUB_STEP_SUMMARY"
