@@ -2,6 +2,11 @@ name: R2 Checkpoint 25 GB Dry Run
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/r2-checkpoint-dry-run.yml"
+      - ".github/workflows/historical-backfill.yml"
+      - "scripts/r2-snapshot-store.sh"
   push:
     paths:
       - ".github/workflows/r2-checkpoint-dry-run.yml"
