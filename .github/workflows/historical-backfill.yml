@@ -1,0 +1,105 @@
+name: Historical Snapshot Backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Start or retry from the durable R2 checkpoint
+        required: true
+        default: resume
+        type: choice
+        options:
+          - resume
+          - retry
+      batch_dates:
+        description: Calendar dates per durable checkpoint batch
+        required: true
+        default: "25"
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wall-explorer-historical-snapshot
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+      WALL_EXPLORER_URL: ${{ vars.WALL_EXPLORER_URL }}
+      OAI_SITES_AUTHORIZATION: ${{ secrets.OAI_SITES_AUTHORIZATION }}
+      SNAPSHOT_OUTPUT_ROOT: snapshot-output
+      SNAPSHOT_VERSION: 2026-08-17-v1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.13.0"
+          cache: npm
+      - name: Install project dependencies
+        run: npm ci
+      - name: Install the S3-compatible client
+        run: python3 -m pip install --disable-pip-version-check awscli
+      - name: Validate required secret configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
+            if [ -z "${!key:-}" ]; then
+              echo "Required GitHub secret is missing: $key" >&2
+              exit 1
+            fi
+          done
+      - name: Restore the last durable checkpoint
+        run: bash scripts/r2-snapshot-store.sh restore
+      - name: Resume server-side historical batches
+        id: builder
+        shell: bash
+        env:
+          BATCH_DATES: ${{ inputs.batch_dates || '25' }}
+        run: |
+          set -euo pipefail
+          started_at=$SECONDS
+          while [ $((SECONDS - started_at)) -lt 18000 ]; do
+            node --experimental-strip-types scripts/build-historical-snapshot.mjs \
+              --start 2010-01-04 \
+              --end 2025-12-28 \
+              --snapshot-cutoff 2026-08-17 \
+              --continuation-cursor 2025-12-28 \
+              --continuation-rows 152052 \
+              --continuation-units 464 \
+              --total-units 12140 \
+              --workers 2 \
+              --max-dates "$BATCH_DATES" \
+              --output "$SNAPSHOT_OUTPUT_ROOT"
+            bash scripts/r2-snapshot-store.sh checkpoint
+            state=$(node -e "const s=require('./snapshot-output/job-status.json'); process.stdout.write(s.status)")
+            if [ "$state" = "complete" ]; then
+              echo "complete=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "complete=false" >> "$GITHUB_OUTPUT"
+      - name: Publish the verified Snapshot, Manifest and checksums
+        if: steps.builder.outputs.complete == 'true'
+        run: bash scripts/r2-snapshot-store.sh publish
+      - name: Import the completed Snapshot into the Web App
+        if: steps.builder.outputs.complete == 'true' && env.WALL_EXPLORER_URL != '' && env.OAI_SITES_AUTHORIZATION != ''
+        run: npm run snapshot:bootstrap
+      - name: Preserve the latest checkpoint after a failed run
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f snapshot-output/historical-2026-08-17.building/historical.sqlite ] && [ -f snapshot-output/job-status.json ]; then
+            bash scripts/r2-snapshot-store.sh checkpoint
+          fi
+
