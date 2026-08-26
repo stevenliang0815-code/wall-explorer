@@ -2,6 +2,9 @@ name: R2 Capacity Watchdog
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/r2-capacity-watchdog.yml"
   schedule:
     - cron: "*/15 * * * *"
 
