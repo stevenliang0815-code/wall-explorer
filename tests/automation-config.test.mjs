@@ -78,3 +78,14 @@ test("daily incremental has an external server runner", async () => {
   assert.doesNotMatch(runner, /window|navigator|serviceWorker/i);
   assert.match(runner, /while \(iterations < 5_000\)/);
 });
+
+test("legacy D1 checkpoint export is owner-gated, compressed, and read-only", async () => {
+  const route = await readFile("app/api/legacy-checkpoint/route.ts", "utf8");
+  assert.match(route, /getChatGPTUser/);
+  assert.match(route, /LEGACY_CHECKPOINT_EXPORT_OWNER/);
+  assert.match(route, /historical_observations/);
+  assert.match(route, /backfill_checkpoints/);
+  assert.match(route, /CompressionStream\("gzip"\)/);
+  assert.match(route, /Content-Disposition/);
+  assert.doesNotMatch(route, /\b(?:INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER)\b/i);
+});
