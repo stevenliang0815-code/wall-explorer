@@ -15,6 +15,10 @@ on:
         description: Calendar dates per durable checkpoint batch
         required: true
         default: "25"
+      max_cycles:
+        description: Checkpoint batches in this run; 0 uses the full server window
+        required: true
+        default: "0"
   schedule:
     - cron: "17 * * * *"
 
@@ -66,10 +70,13 @@ jobs:
         shell: bash
         env:
           BATCH_DATES: ${{ inputs.batch_dates || '25' }}
+          MAX_CYCLES: ${{ inputs.max_cycles || '0' }}
         run: |
           set -euo pipefail
           started_at=$SECONDS
+          cycles=0
           while [ $((SECONDS - started_at)) -lt 18000 ]; do
+            cycles=$((cycles + 1))
             node --experimental-strip-types scripts/build-historical-snapshot.mjs \
               --start 2010-01-04 \
               --end 2025-12-28 \
@@ -86,6 +93,10 @@ jobs:
             if [ "$state" = "complete" ]; then
               echo "complete=true" >> "$GITHUB_OUTPUT"
               exit 0
+            fi
+            if [ "$MAX_CYCLES" -gt 0 ] && [ "$cycles" -ge "$MAX_CYCLES" ]; then
+              echo "Canary limit reached after $cycles durable checkpoint batch(es)."
+              break
             fi
           done
           echo "complete=false" >> "$GITHUB_OUTPUT"
