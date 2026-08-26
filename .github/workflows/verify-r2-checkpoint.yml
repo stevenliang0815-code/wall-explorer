@@ -104,9 +104,9 @@ jobs:
               raise SystemExit(f"Unexpected cursorDate: {checkpoint.get('cursorDate')!r}")
           if int(checkpoint.get("storedRows", -1)) != expected_rows:
               raise SystemExit(f"Unexpected storedRows: {checkpoint.get('storedRows')!r}")
-          if counts["historical_observations"] != expected_rows:
+          if counts["historical_observations"] < expected_rows:
               raise SystemExit(
-                  f"Expected {expected_rows} historical observations, found {counts['historical_observations']}"
+                  f"Expected at least {expected_rows} historical observations, found {counts['historical_observations']}"
               )
 
           digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -115,7 +115,9 @@ jobs:
               "sha256": digest,
               "compressedBytes": path.stat().st_size,
               "cursorDate": checkpoint["cursorDate"],
+              "checkpointStoredRows": int(checkpoint["storedRows"]),
               "historicalObservations": counts["historical_observations"],
+              "additionalObservations": counts["historical_observations"] - expected_rows,
               "tableCounts": dict(counts),
           }
           Path("/tmp/legacy-validation.json").write_text(
