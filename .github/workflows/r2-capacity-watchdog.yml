@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - ".github/workflows/r2-capacity-watchdog.yml"
+      - "scripts/r2-snapshot-store.sh"
   schedule:
     - cron: "*/15 * * * *"
 
@@ -21,14 +22,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      R2_BUCKET: ${{ secrets.R2_BUCKET }}
-      R2_LIMIT_BYTES: "8589934592"
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+      R2_STORAGE_LIMIT_BYTES: "9700000000"
       GH_TOKEN: ${{ github.token }}
 
     steps:
+      - uses: actions/checkout@v4
+
       - name: Validate required configuration
         shell: bash
         run: |
@@ -43,43 +46,35 @@ jobs:
       - name: Install S3-compatible client
         run: python3 -m pip install --disable-pip-version-check awscli
 
-      - name: Measure R2 bucket usage
+      - name: Measure completed objects and multipart parts
         id: usage
         continue-on-error: true
         shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          AWS_EC2_METADATA_DISABLED: "true"
-          AWS_PAGER: ""
         run: |
           set -euo pipefail
-          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          listing=$(aws --endpoint-url "$endpoint" s3 ls "s3://${R2_BUCKET}" --recursive --summarize)
-          usage_bytes=$(awk '/Total Size:/ {print $3}' <<<"$listing")
-          usage_bytes=${usage_bytes:-0}
+          usage_bytes=$(bash scripts/r2-snapshot-store.sh usage-bytes)
           if ! [[ "$usage_bytes" =~ ^[0-9]+$ ]]; then
-            echo "Unable to parse R2 bucket usage" >&2
+            echo "Unable to parse complete R2 storage usage" >&2
             exit 1
           fi
           echo "usage_bytes=$usage_bytes" >> "$GITHUB_OUTPUT"
           echo "R2_USAGE_BYTES=$usage_bytes"
-          if [ "$usage_bytes" -gt "$R2_LIMIT_BYTES" ]; then
+          if [ "$usage_bytes" -ge "$R2_STORAGE_LIMIT_BYTES" ]; then
             echo "over_limit=true" >> "$GITHUB_OUTPUT"
           else
             echo "over_limit=false" >> "$GITHUB_OUTPUT"
           fi
-          python3 - "$usage_bytes" "$R2_LIMIT_BYTES" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          python3 - "$usage_bytes" "$R2_STORAGE_LIMIT_BYTES" >> "$GITHUB_STEP_SUMMARY" <<'PY'
           import sys
           usage, limit = map(int, sys.argv[1:])
           print("## R2 capacity watchdog")
           print()
-          print(f"- Current usage: **{usage / 1024**3:.3f} GiB**")
-          print(f"- Stop threshold: **{limit / 1024**3:.0f} GiB**")
+          print(f"- Current usage: **{usage:,} bytes** ({usage / 1_000_000_000:.6f} GB / {usage / 1024**3:.6f} GiB)")
+          print(f"- Hard stop: **{limit:,} bytes** ({limit / 1_000_000_000:.2f} GB)")
+          print(f"- Remaining below hard stop: **{max(0, limit - usage):,} bytes**")
           PY
 
-      - name: Record capacity stop in R2
+      - name: Record the capacity stop state
         if: steps.usage.outputs.over_limit == 'true'
         shell: bash
         env:
@@ -91,10 +86,10 @@ jobs:
         run: |
           set -euo pipefail
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          printf '{"status":"stopped_capacity_limit","usageBytes":%s,"limitBytes":%s,"checkedAt":"%s"}\n'             "${{ steps.usage.outputs.usage_bytes }}" "$R2_LIMIT_BYTES" "$(date -u +%FT%TZ)"             > /tmp/capacity-stop.json
+          printf '{"status":"stopped_capacity_limit","usageBytes":%s,"limitBytes":%s,"checkedAt":"%s"}\n'             "${{ steps.usage.outputs.usage_bytes }}"             "$R2_STORAGE_LIMIT_BYTES"             "$(date -u +%FT%TZ)" > /tmp/capacity-stop.json
           aws --endpoint-url "$endpoint" s3 cp             /tmp/capacity-stop.json             "s3://${R2_BUCKET}/jobs/historical/capacity-stop.json"             --content-type application/json             --cache-control no-store             --only-show-errors
 
-      - name: Stop historical jobs when over limit or usage cannot be verified
+      - name: Stop historical jobs when unsafe
         if: steps.usage.outcome == 'failure' || steps.usage.outputs.over_limit == 'true'
         shell: bash
         run: |
@@ -105,7 +100,7 @@ jobs:
                 gh run cancel "$run_id" --repo "${GITHUB_REPOSITORY}"
               done
 
-      - name: Fail closed when R2 usage could not be measured
+      - name: Fail closed when usage cannot be measured
         if: steps.usage.outcome == 'failure'
         run: |
           echo "R2 usage could not be verified; historical jobs were stopped safely." >&2
