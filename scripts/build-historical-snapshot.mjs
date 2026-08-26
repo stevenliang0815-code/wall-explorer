@@ -203,6 +203,11 @@ if (openFailures || duplicates || survivorshipViolations || lookAheadViolations)
 }
 
 db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+const integrityRows = db.prepare("PRAGMA integrity_check").all();
+if (integrityRows.length !== 1 || integrityRows[0].integrity_check !== "ok") {
+  db.close();
+  throw new Error(`SQLite integrity_check failed: ${JSON.stringify(integrityRows.slice(0, 10))}`);
+}
 const rowCount = db.prepare("SELECT count(*) count FROM historical_observations").get().count;
 const securityCount = db.prepare("SELECT count(*) count FROM (SELECT market,code FROM historical_observations GROUP BY market,code)").get().count;
 const marketStats = Object.fromEntries(markets.map((market) => {
@@ -235,19 +240,22 @@ while (true) {
 const finalStatus = await writeJobStatus("publishing", end);
 db.close();
 
-const sqliteGzipPath = join(workDir, "historical.sqlite.gz");
-await pipeline(createReadStream(dbPath), createGzip({ level: 9 }), createWriteStream(sqliteGzipPath));
 async function sha256File(path) {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk);
   return hash.digest("hex");
 }
+const rawSqliteInfo = await stat(dbPath);
+const rawSqliteSha256 = await sha256File(dbPath);
+const sqliteGzipPath = join(workDir, "historical.sqlite.gz");
+await pipeline(createReadStream(dbPath), createGzip({ level: 9 }), createWriteStream(sqliteGzipPath));
+
 const sqliteInfo = await stat(sqliteGzipPath);
 const manifest = {
   format: SNAPSHOT_FORMAT, schemaVersion: SNAPSHOT_SCHEMA_VERSION,
   snapshotVersion: `${snapshotCutoff}-v1`, generatedAt: new Date().toISOString(), cutoffDate: snapshotCutoff,
   range: { start, end }, rowCount, securityCount, markets: marketStats,
-  sqlite: { path: basename(sqliteGzipPath), bytes: sqliteInfo.size, sha256: await sha256File(sqliteGzipPath), encoding: "gzip" },
+  sqlite: { path: basename(sqliteGzipPath), bytes: sqliteInfo.size, sha256: await sha256File(sqliteGzipPath), encoding: "gzip", uncompressedBytes: rawSqliteInfo.size, uncompressedSha256: rawSqliteSha256 },
   chunks,
   validation: { status: "pass", openFailures: 0, duplicates: 0, survivorshipViolations: 0, lookAheadViolations: 0 },
   mergeStrategy: "upsert",
