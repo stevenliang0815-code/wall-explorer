@@ -64,6 +64,7 @@ jobs:
             exit 1
           fi
           echo "usage_bytes=$usage_bytes" >> "$GITHUB_OUTPUT"
+          echo "R2_USAGE_BYTES=$usage_bytes"
           if [ "$usage_bytes" -gt "$R2_LIMIT_BYTES" ]; then
             echo "over_limit=true" >> "$GITHUB_OUTPUT"
           else
