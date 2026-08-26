@@ -80,18 +80,29 @@ checkpoint_db_path() {
 }
 
 checkpoint_preflight() {
-  local checkpoint_db current_bytes local_bytes projected_peak remote_exists
+  local checkpoint_db current_bytes local_bytes projected_peak remote_exists remote_size
+
+  remote_exists=false
+  remote_size=0
+  if remote_size=$(r2 s3api head-object \
+    --bucket "$bucket" \
+    --key "$checkpoint_key" \
+    --query ContentLength \
+    --output text 2>/dev/null); then
+    remote_exists=true
+  else
+    remote_size=0
+  fi
 
   checkpoint_db=$(checkpoint_db_path)
-  test -f "$checkpoint_db"
+  if [ -f "$checkpoint_db" ]; then
+    local_bytes=$(stat -c '%s' "$checkpoint_db")
+  else
+    local_bytes=$remote_size
+  fi
 
   current_bytes=$(r2_usage_bytes)
-  local_bytes=$(stat -c '%s' "$checkpoint_db")
   projected_peak=$((current_bytes + local_bytes + next_batch_reserve_bytes))
-  remote_exists=false
-  if r2 s3api head-object --bucket "$bucket" --key "$checkpoint_key" >/dev/null 2>&1; then
-    remote_exists=true
-  fi
 
   echo "R2 current bytes: $current_bytes"
   echo "Checkpoint local bytes: $local_bytes"
@@ -130,6 +141,7 @@ case "$operation" in
   checkpoint)
     checkpoint_preflight
     checkpoint_db=$(checkpoint_db_path)
+    test -f "$checkpoint_db"
     test -f "$output_root/job-status.json"
     sha256sum "$checkpoint_db" | awk '{print $1}' > "$output_root/builder.sqlite.sha256"
     r2 s3 cp "$checkpoint_db" "s3://${bucket}/${checkpoint_key}" --only-show-errors
