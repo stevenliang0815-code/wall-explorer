@@ -31,6 +31,7 @@ concurrency:
 
 jobs:
   backfill:
+    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_HISTORICAL_SCHEDULE == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 330
     env:
