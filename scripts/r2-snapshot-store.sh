@@ -52,8 +52,12 @@ case "$operation" in
   status)
     r2 s3 cp "s3://${bucket}/jobs/historical/status.json" - --only-show-errors
     ;;
+  usage-bytes)
+    usage_bytes=$(r2 s3 ls "s3://${bucket}" --recursive --summarize | awk '/Total Size:/ {print $3}')
+    echo "${usage_bytes:-0}"
+    ;;
   *)
-    echo "Usage: $0 {restore|checkpoint|publish|status}" >&2
+    echo "Usage: $0 {restore|checkpoint|publish|status|usage-bytes}" >&2
     exit 2
     ;;
 esac
