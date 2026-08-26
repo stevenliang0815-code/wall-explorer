@@ -35,26 +35,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     env:
-      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
       R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
       WALL_EXPLORER_URL: ${{ vars.WALL_EXPLORER_URL }}
       OAI_SITES_AUTHORIZATION: ${{ secrets.OAI_SITES_AUTHORIZATION }}
       SNAPSHOT_OUTPUT_ROOT: snapshot-output
       SNAPSHOT_VERSION: 2026-08-17-v1
-      R2_STORAGE_LIMIT_BYTES: "8589934592"
+      R2_STORAGE_LIMIT_BYTES: "9700000000"
+      R2_NEXT_BATCH_RESERVE_BYTES: "100000000"
+      R2_IMMUTABLE_RAW_CHECKPOINT: "true"
+      R2_ALLOW_LEGACY_PUBLISH: "false"
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22.13.0"
           cache: npm
+
       - name: Install project dependencies
         run: npm ci
+
       - name: Install the S3-compatible client
         run: python3 -m pip install --disable-pip-version-check awscli
+
       - name: Validate required secret configuration
         shell: bash
         run: |
@@ -65,20 +73,51 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Preflight the next durable checkpoint
+        id: preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          if bash scripts/r2-snapshot-store.sh checkpoint-preflight; then
+            echo "safe=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "safe=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Backfill stopped before execution"
+              echo
+              echo "The next raw SQLite checkpoint cannot be persisted below the 9.70 GB hard stop."
+              echo "The existing 95.16% builder.sqlite remains untouched in R2."
+              echo "An externally durable staging destination is required before continuation."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Restore the last durable checkpoint
+        if: steps.preflight.outputs.safe == 'true'
         run: bash scripts/r2-snapshot-store.sh restore
+
       - name: Resume server-side historical batches
+        if: steps.preflight.outputs.safe == 'true'
         id: builder
         shell: bash
         env:
-          BATCH_DATES: ${{ inputs.batch_dates || '25' }}
-          MAX_CYCLES: ${{ inputs.max_cycles || '0' }}
+          BATCH_DATES: ${{ inputs.batch_dates || '2' }}
+          MAX_CYCLES: ${{ inputs.max_cycles || '1' }}
         run: |
           set -euo pipefail
           started_at=$SECONDS
           cycles=0
           while [ $((SECONDS - started_at)) -lt 18000 ]; do
             cycles=$((cycles + 1))
+
+            usage_before=$(bash scripts/r2-snapshot-store.sh usage-bytes)
+            echo "R2 bytes before batch: $usage_before"
+            if [ "$usage_before" -ge "$R2_STORAGE_LIMIT_BYTES" ]; then
+              echo "::warning::R2 is at the 9.70 GB hard stop; no batch was started."
+              echo "complete=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
             node --experimental-strip-types scripts/build-historical-snapshot.mjs \
               --start 2010-01-04 \
               --end 2025-12-28 \
@@ -90,14 +129,17 @@ jobs:
               --workers 2 \
               --max-dates "$BATCH_DATES" \
               --output "$SNAPSHOT_OUTPUT_ROOT"
+
             bash scripts/r2-snapshot-store.sh checkpoint
-            usage_bytes=$(bash scripts/r2-snapshot-store.sh usage-bytes)
-            echo "R2 bucket usage: $usage_bytes / $R2_STORAGE_LIMIT_BYTES bytes"
-            if [ "$usage_bytes" -gt "$R2_STORAGE_LIMIT_BYTES" ]; then
-              echo "::warning::R2 usage exceeded the 8 GiB safety limit; stopping after the durable checkpoint."
+
+            usage_after=$(bash scripts/r2-snapshot-store.sh usage-bytes)
+            echo "R2 bytes after checkpoint: $usage_after"
+            if [ "$usage_after" -ge "$R2_STORAGE_LIMIT_BYTES" ]; then
+              echo "::warning::R2 reached the 9.70 GB hard stop; no further batch will start."
               echo "complete=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
+
             state=$(node -e "const s=require('./snapshot-output/job-status.json'); process.stdout.write(s.status)")
             if [ "$state" = "complete" ]; then
               echo "complete=true" >> "$GITHUB_OUTPUT"
@@ -109,17 +151,22 @@ jobs:
             fi
           done
           echo "complete=false" >> "$GITHUB_OUTPUT"
-      - name: Publish the verified Snapshot, Manifest and checksums
+
+      - name: Block legacy duplicate Snapshot publishing
         if: steps.builder.outputs.complete == 'true'
-        run: bash scripts/r2-snapshot-store.sh publish
-      - name: Import the completed Snapshot into the Web App
-        if: steps.builder.outputs.complete == 'true' && env.WALL_EXPLORER_URL != '' && env.OAI_SITES_AUTHORIZATION != ''
-        run: npm run snapshot:bootstrap
-      - name: Preserve the latest checkpoint after a failed run
-        if: failure()
+        run: |
+          echo "::error::The legacy publisher duplicates raw SQLite and is disabled pending the verified migration."
+          exit 1
+
+      - name: Confirm immutable R2 recovery point
+        if: always()
         shell: bash
         run: |
-          if [ -f snapshot-output/historical-2026-08-17.building/historical.sqlite ] && [ -f snapshot-output/job-status.json ]; then
-            bash scripts/r2-snapshot-store.sh checkpoint
-          fi
-
+          {
+            echo "## Immutable recovery point"
+            echo
+            echo "- R2 hard stop: 9,700,000,000 bytes"
+            echo "- Existing builder.sqlite replacement: blocked"
+            echo "- Legacy raw Snapshot publishing: blocked"
+            echo "- No failure handler uploads a replacement SQLite"
+          } >> "$GITHUB_STEP_SUMMARY"
