@@ -1,0 +1,108 @@
+name: R2 Capacity Watchdog
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: wall-explorer-r2-capacity-watchdog
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_LIMIT_BYTES: "8589934592"
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Validate required configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
+            if [ -z "${!key:-}" ]; then
+              echo "Required GitHub secret is missing: $key" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install S3-compatible client
+        run: python3 -m pip install --disable-pip-version-check awscli
+
+      - name: Measure R2 bucket usage
+        id: usage
+        continue-on-error: true
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          AWS_PAGER: ""
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          listing=$(aws --endpoint-url "$endpoint" s3 ls "s3://${R2_BUCKET}" --recursive --summarize)
+          usage_bytes=$(awk '/Total Size:/ {print $3}' <<<"$listing")
+          usage_bytes=${usage_bytes:-0}
+          if ! [[ "$usage_bytes" =~ ^[0-9]+$ ]]; then
+            echo "Unable to parse R2 bucket usage" >&2
+            exit 1
+          fi
+          echo "usage_bytes=$usage_bytes" >> "$GITHUB_OUTPUT"
+          if [ "$usage_bytes" -gt "$R2_LIMIT_BYTES" ]; then
+            echo "over_limit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "over_limit=false" >> "$GITHUB_OUTPUT"
+          fi
+          python3 - "$usage_bytes" "$R2_LIMIT_BYTES" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import sys
+          usage, limit = map(int, sys.argv[1:])
+          print("## R2 capacity watchdog")
+          print()
+          print(f"- Current usage: **{usage / 1024**3:.3f} GiB**")
+          print(f"- Stop threshold: **{limit / 1024**3:.0f} GiB**")
+          PY
+
+      - name: Record capacity stop in R2
+        if: steps.usage.outputs.over_limit == 'true'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          AWS_PAGER: ""
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          printf '{"status":"stopped_capacity_limit","usageBytes":%s,"limitBytes":%s,"checkedAt":"%s"}\n'             "${{ steps.usage.outputs.usage_bytes }}" "$R2_LIMIT_BYTES" "$(date -u +%FT%TZ)"             > /tmp/capacity-stop.json
+          aws --endpoint-url "$endpoint" s3 cp             /tmp/capacity-stop.json             "s3://${R2_BUCKET}/jobs/historical/capacity-stop.json"             --content-type application/json             --cache-control no-store             --only-show-errors
+
+      - name: Stop historical jobs when over limit or usage cannot be verified
+        if: steps.usage.outcome == 'failure' || steps.usage.outputs.over_limit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run list             --repo "${GITHUB_REPOSITORY}"             --workflow historical-backfill.yml             --limit 100             --json databaseId,status             --jq '.[] | select(.status == "in_progress" or .status == "queued") | .databaseId'             | while read -r run_id; do
+                [ -n "$run_id" ] || continue
+                echo "Cancelling historical workflow run $run_id"
+                gh run cancel "$run_id" --repo "${GITHUB_REPOSITORY}"
+              done
+
+      - name: Fail closed when R2 usage could not be measured
+        if: steps.usage.outcome == 'failure'
+        run: |
+          echo "R2 usage could not be verified; historical jobs were stopped safely." >&2
+          exit 1
