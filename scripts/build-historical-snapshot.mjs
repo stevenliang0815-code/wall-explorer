@@ -182,6 +182,15 @@ await Promise.all(Array.from({ length: Math.min(workers, batchDates.length) }, a
   }
 }));
 
+const failedAfterBatch = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status='failed'").get().count;
+if (failedAfterBatch > 0) {
+  db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  const state = await writeJobStatus("failed", batchDates.at(-1) ?? null, `${failedAfterBatch} historical unit(s) failed; automatic continuation is blocked.`);
+  db.close();
+  console.log(JSON.stringify(state));
+  throw new Error(`Historical batch stopped after ${failedAfterBatch} failed unit(s). The last verified R2 checkpoint remains the recovery point.`);
+}
+
 const remainingUnits = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status!='completed'").get().count
   + allDates.reduce((sum, date) => sum + markets.filter((market) => !completed.get(market, date)).length, 0);
 const completedUnits = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status='completed'").get().count;
@@ -275,3 +284,4 @@ await writeFile(statusPath, `${JSON.stringify({
   releaseDir,
 }, null, 2)}\n`);
 console.log(JSON.stringify({ status: "complete", releaseDir, snapshotVersion: check.snapshotVersion, rows: check.rowCount, chunks: check.chunks.length, sqliteBytes: check.sqlite.bytes }));
+

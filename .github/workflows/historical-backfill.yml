@@ -24,6 +24,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
   group: wall-explorer-historical-snapshot
@@ -31,7 +32,7 @@ concurrency:
 
 jobs:
   backfill:
-    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_HISTORICAL_SCHEDULE == 'true'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 330
     env:
@@ -47,6 +48,7 @@ jobs:
       R2_STORAGE_LIMIT_BYTES: "25000000000"
       R2_NEXT_BATCH_RESERVE_BYTES: "100000000"
       R2_ALLOW_LEGACY_PUBLISH: "false"
+      GH_TOKEN: ${{ github.token }}
       AWS_MAX_ATTEMPTS: "3"
       AWS_RETRY_MODE: standard
 
@@ -75,7 +77,30 @@ jobs:
             fi
           done
 
+      - name: Check whether final gzip is already complete
+        id: final_state
+        shell: bash
+        run: |
+          if bash scripts/r2-finalize-snapshot.sh is-finalized; then
+            echo "finalized=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "finalized=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check durable stop marker
+        id: stop_state
+        if: steps.final_state.outputs.finalized != 'true'
+        shell: bash
+        run: |
+          if bash scripts/r2-finalize-snapshot.sh is-stopped; then
+            echo "stopped=true" >> "$GITHUB_OUTPUT"
+            echo "A durable stop marker exists; automatic backfill remains blocked." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "stopped=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Preflight the next durable checkpoint
+        if: steps.final_state.outputs.finalized != 'true' && steps.stop_state.outputs.stopped != 'true'
         id: preflight
         shell: bash
         run: |
@@ -94,16 +119,16 @@ jobs:
           fi
 
       - name: Restore the last durable checkpoint
-        if: steps.preflight.outputs.safe == 'true'
+        if: steps.final_state.outputs.finalized != 'true' && steps.stop_state.outputs.stopped != 'true' && steps.preflight.outputs.safe == 'true'
         run: bash scripts/r2-snapshot-store.sh restore
 
       - name: Resume server-side historical batches
-        if: steps.preflight.outputs.safe == 'true'
+        if: steps.final_state.outputs.finalized != 'true' && steps.stop_state.outputs.stopped != 'true' && steps.preflight.outputs.safe == 'true'
         id: builder
         shell: bash
         env:
           BATCH_DATES: ${{ inputs.batch_dates || '2' }}
-          MAX_CYCLES: ${{ inputs.max_cycles || '1' }}
+          MAX_CYCLES: ${{ github.event_name == 'workflow_dispatch' && inputs.max_cycles || '0' }}
         run: |
           set -euo pipefail
           started_at=$SECONDS
@@ -114,9 +139,8 @@ jobs:
             usage_before=$(bash scripts/r2-snapshot-store.sh usage-bytes)
             echo "R2 bytes before batch: $usage_before"
             if [ "$usage_before" -ge "$R2_STORAGE_LIMIT_BYTES" ]; then
-              echo "::warning::R2 is at the 25 GB hard stop; no batch was started."
-              echo "complete=false" >> "$GITHUB_OUTPUT"
-              exit 0
+              echo "::error::R2 is at the 25 GB hard stop; no batch was started."
+              exit 42
             fi
 
             node --experimental-strip-types scripts/build-historical-snapshot.mjs \
@@ -136,9 +160,8 @@ jobs:
             usage_after=$(bash scripts/r2-snapshot-store.sh usage-bytes)
             echo "R2 bytes after checkpoint: $usage_after"
             if [ "$usage_after" -ge "$R2_STORAGE_LIMIT_BYTES" ]; then
-              echo "::warning::R2 reached the 25 GB hard stop; no further batch will start."
-              echo "complete=false" >> "$GITHUB_OUTPUT"
-              exit 0
+              echo "::error::R2 reached the 25 GB hard stop; no further batch will start."
+              exit 44
             fi
 
             state=$(node -e "const s=require('./snapshot-output/job-status.json'); process.stdout.write(s.status)")
@@ -154,7 +177,7 @@ jobs:
           echo "complete=false" >> "$GITHUB_OUTPUT"
 
       - name: Validate the completed raw Snapshot
-        if: steps.builder.outputs.complete == 'true'
+        if: steps.final_state.outputs.finalized != 'true' && steps.stop_state.outputs.stopped != 'true' && steps.builder.outputs.complete == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -215,7 +238,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep legacy duplicate publishing blocked
-        if: steps.builder.outputs.complete == 'true'
+        if: steps.final_state.outputs.finalized != 'true' && steps.stop_state.outputs.stopped != 'true' && steps.builder.outputs.complete == 'true'
         run: |
           echo "Final gzip was validated locally. Automatic raw deletion/replacement remains blocked pending a dedicated migration gate."
 
@@ -233,3 +256,27 @@ jobs:
             echo "- AWS client attempts are bounded at 3"
             echo "- Legacy duplicate Snapshot publishing remains blocked"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record preflight stop and notify owner
+        if: steps.final_state.outputs.finalized != 'true' && steps.stop_state.outputs.stopped != 'true' && steps.preflight.outputs.safe == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          reason="Projected peak, unfinished multipart, or orphan candidate blocked the next checkpoint."
+          bash scripts/r2-finalize-snapshot.sh record-stop "$reason"
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Historical Snapshot stopped — preflight — run $GITHUB_RUN_ID" \
+            --body "Automatic backfill stopped before any new checkpoint write. Reason: $reason The last verified R2 recovery point was retained. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Record unexpected stop and notify owner
+        if: failure()
+        shell: bash
+        run: |
+          set -u
+          reason="Historical backfill failed or a validation gate stopped the run."
+          bash scripts/r2-finalize-snapshot.sh record-stop "$reason" || true
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Historical Snapshot stopped — run $GITHUB_RUN_ID" \
+            --body "The automatic flow stopped and will not auto-resume while the durable stop marker exists. The last verified R2 recovery point was retained. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" || true

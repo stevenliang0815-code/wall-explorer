@@ -1,0 +1,207 @@
+name: Historical Snapshot Finalize
+
+on:
+  workflow_run:
+    workflows:
+      - Historical Snapshot Backfill
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: wall-explorer-historical-snapshot
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+      SNAPSHOT_OUTPUT_ROOT: snapshot-output
+      SNAPSHOT_VERSION: 2026-08-17-v1
+      SNAPSHOT_DATE: 2026-08-17
+      SNAPSHOT_EXPECTED_LAST_DATE: 2025-12-28
+      R2_STORAGE_LIMIT_BYTES: "25000000000"
+      R2_FINALIZE_RESERVE_BYTES: "100000000"
+      AWS_MAX_ATTEMPTS: "3"
+      AWS_RETRY_MODE: standard
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SQLite and the S3-compatible client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+          python3 -m pip install --disable-pip-version-check awscli
+
+      - name: Validate required secret configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
+            if [ -z "${!key:-}" ]; then
+              echo "Required GitHub secret is missing: $key" >&2
+              exit 1
+            fi
+          done
+
+      - name: Check whether finalization is already complete
+        id: state
+        shell: bash
+        run: |
+          if bash scripts/r2-finalize-snapshot.sh is-finalized; then
+            echo "finalized=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "finalized=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check whether raw checkpoint reached 100%
+        id: ready
+        if: steps.state.outputs.finalized != 'true'
+        shell: bash
+        run: |
+          if bash scripts/r2-finalize-snapshot.sh is-ready; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Backfill is not 100% yet; finalization will wait for a later successful backfill run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Check durable stop marker
+        id: stop_state
+        if: steps.state.outputs.finalized != 'true'
+        shell: bash
+        run: |
+          if bash scripts/r2-finalize-snapshot.sh is-stopped; then
+            echo "stopped=true" >> "$GITHUB_OUTPUT"
+            echo "A durable stop marker exists; automatic finalization remains blocked." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "stopped=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read-only finalization preflight
+        if: steps.state.outputs.finalized != 'true' && steps.ready.outputs.ready == 'true' && steps.stop_state.outputs.stopped != 'true'
+        run: bash scripts/r2-finalize-snapshot.sh preflight
+
+      - name: Download canonical raw SQLite
+        if: steps.state.outputs.finalized != 'true' && steps.ready.outputs.ready == 'true' && steps.stop_state.outputs.stopped != 'true'
+        run: bash scripts/r2-finalize-snapshot.sh download-raw "$RUNNER_TEMP/builder.sqlite"
+
+      - name: Validate raw database and build deterministic gzip
+        if: steps.state.outputs.finalized != 'true' && steps.ready.outputs.ready == 'true' && steps.stop_state.outputs.stopped != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          db="$RUNNER_TEMP/builder.sqlite"
+          gz="$RUNNER_TEMP/builder.sqlite.gz"
+          status_file="snapshot-output/job-status.json"
+
+          sqlite3 "$db" 'PRAGMA wal_checkpoint(TRUNCATE);'
+          integrity=$(sqlite3 "$db" 'PRAGMA integrity_check;')
+          test "$integrity" = "ok"
+          test ! -s "$db-wal"
+
+          db_rows=$(sqlite3 "$db" 'SELECT count(*) FROM historical_observations;')
+          duplicate_rows=$(sqlite3 "$db" "SELECT count(*) FROM (SELECT market,code,trading_date,count(*) n FROM historical_observations GROUP BY market,code,trading_date HAVING n>1);")
+          open_failures=$(sqlite3 "$db" "SELECT count(*) FROM builder_checkpoints WHERE status!='completed';")
+          survivorship_violations=$(sqlite3 "$db" "SELECT count(*) FROM historical_observations WHERE source_scope!='full_market_daily';")
+          lookahead_violations=$(sqlite3 "$db" "SELECT count(*) FROM historical_observations WHERE substr(usable_from,1,10)<=trading_date;")
+          read -r status_name progress stored_rows continuation_rows current_date overall_units total_units < <(
+            jq -r '[.status,.progress,.storedRows,(.continuationRows//0),.currentDate,.overallCompletedUnits,.totalUnits] | @tsv' "$status_file"
+          )
+
+          test "$status_name" = "complete"
+          test "$progress" = "100"
+          test "$current_date" = "$SNAPSHOT_EXPECTED_LAST_DATE"
+          test "$overall_units" -eq "$total_units"
+          test $((db_rows + continuation_rows)) -eq "$stored_rows"
+          test "$duplicate_rows" -eq 0
+          test "$open_failures" -eq 0
+          test "$survivorship_violations" -eq 0
+          test "$lookahead_violations" -eq 0
+
+          raw_sha=$(sha256sum "$db" | awk '{print $1}')
+          raw_bytes=$(stat -c '%s' "$db")
+          gzip -9n -c "$db" > "$gz"
+          gzip -t "$gz"
+          gzip_sha=$(sha256sum "$gz" | awk '{print $1}')
+          gzip_bytes=$(stat -c '%s' "$gz")
+          roundtrip_sha=$(gzip -dc "$gz" | sha256sum | awk '{print $1}')
+          test "$roundtrip_sha" = "$raw_sha"
+
+          schema_version=$(sqlite3 "$db" 'PRAGMA user_version;')
+          jq -n \
+            --arg compressedFilename "historical.sqlite.gz" \
+            --argjson compressedSize "$gzip_bytes" \
+            --argjson uncompressedSize "$raw_bytes" \
+            --arg compression "gzip-9" \
+            --arg sha256 "$raw_sha" \
+            --arg compressedSha256 "$gzip_sha" \
+            --arg snapshotDate "$SNAPSHOT_DATE" \
+            --argjson rowCount "$db_rows" \
+            --argjson totalStoredRows "$stored_rows" \
+            --arg schemaVersion "$schema_version" \
+            --arg snapshotVersion "$SNAPSHOT_VERSION" \
+            --arg lastDate "$current_date" \
+            '{compressedFilename:$compressedFilename,compressedSize:$compressedSize,uncompressedSize:$uncompressedSize,compression:$compression,sha256:$sha256,compressedSha256:$compressedSha256,snapshotDate:$snapshotDate,rowCount:$rowCount,totalStoredRows:$totalStoredRows,schemaVersion:$schemaVersion,snapshotVersion:$snapshotVersion,progress:100,lastCompletedDate:$lastDate,integrityCheck:"ok",gzipTest:"pass",roundtripSha256:"match",wal:"clean",unfinishedMultipart:0}' \
+            > snapshot-output/final-manifest.json
+
+          {
+            echo "## Raw Snapshot and gzip validation"
+            echo
+            echo "- SQLite integrity: ok"
+            echo "- Progress / last date: 100% / $current_date"
+            echo "- Rows: $stored_rows (SQLite segment: $db_rows)"
+            echo "- WAL: clean"
+            echo "- Duplicates / unfinished units: 0 / 0"
+            echo "- Survivorship / look-ahead violations: 0 / 0"
+            echo "- Raw bytes / SHA-256: $raw_bytes / $raw_sha"
+            echo "- Gzip level / bytes / SHA-256: 9 / $gzip_bytes / $gzip_sha"
+            echo "- gzip -t / decompressed SHA-256: pass / match"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload, verify, and safely promote gzip Snapshot
+        if: steps.state.outputs.finalized != 'true' && steps.ready.outputs.ready == 'true' && steps.stop_state.outputs.stopped != 'true'
+        run: |
+          bash scripts/r2-finalize-snapshot.sh migrate \
+            "$RUNNER_TEMP/builder.sqlite" \
+            "$RUNNER_TEMP/builder.sqlite.gz" \
+            snapshot-output/final-manifest.json \
+            snapshot-output/job-status.json
+
+      - name: Record recovery outcome
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Fail-closed recovery policy"
+            echo
+            echo "- R2 hard stop remains 25,000,000,000 bytes."
+            echo "- Any failure stops the workflow immediately."
+            echo "- Raw SQLite is retained until the R2 gzip candidate passes size, gzip -t, compressed SHA-256, and decompressed SHA-256 checks."
+            echo "- After raw deletion, the verified R2 candidate remains the durable recovery source until the final gzip and metadata are independently verified."
+            echo "- Delete/copy promotion operations use a single attempt and are never loop-retried."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record finalization stop and notify owner
+        if: failure()
+        shell: bash
+        run: |
+          set -u
+          reason="Raw validation, gzip validation, capacity guard, upload verification, or safe promotion failed."
+          bash scripts/r2-finalize-snapshot.sh record-stop "$reason" || true
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Historical Snapshot finalization stopped — run $GITHUB_RUN_ID" \
+            --body "The automatic finalization stopped and will not auto-resume while the durable stop marker exists. The last verified raw or gzip candidate recovery point was retained. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" || true
