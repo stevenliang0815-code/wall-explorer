@@ -1,10 +1,10 @@
 name: R2 Read-only Inventory
 
-on:
+"on":
   push:
     paths:
       - ".github/workflows/r2-readonly-inventory.yml"
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -87,11 +87,33 @@ jobs:
           from pathlib import Path
 
           objects_data = json.load(open("/tmp/r2-objects.json", encoding="utf-8"))
+          def purpose(key):
+              if key == "checkpoints/historical/builder.sqlite":
+                  return "legacy canonical raw SQLite"
+              if key.startswith("checkpoints/historical/candidates/") and key.endswith("/builder.sqlite"):
+                  return "retained legacy candidate raw SQLite"
+              if key.startswith("checkpoints/historical/versions/") and key.endswith(".sqlite"):
+                  return "immutable versioned raw SQLite"
+              if key == "checkpoints/historical/latest.json":
+                  return "small canonical checkpoint pointer"
+              if key == "jobs/historical/stop.json":
+                  return "durable pause / stop marker"
+              if key.endswith(".sha256"):
+                  return "checksum metadata"
+              if key.endswith("status.json"):
+                  return "checkpoint or job status metadata"
+              if key.endswith("manifest.json") or key.startswith("manifests/"):
+                  return "snapshot manifest metadata"
+              if key.startswith("legacy-checkpoints/"):
+                  return "legacy D1 recovery checkpoint"
+              return "supporting object"
+
           objects = sorted(
               [{
                   "key": item["Key"],
                   "bytes": int(item["Size"]),
                   "lastModified": item.get("LastModified"),
+                  "purpose": purpose(item["Key"]),
               } for item in objects_data.get("Contents", [])],
               key=lambda item: item["key"],
           )
@@ -133,11 +155,12 @@ jobs:
               out.write(f"- Incomplete multipart uploads: **{len(multipart)}**\n")
               out.write(f"- Incomplete multipart bytes: **{multipart_bytes}**\n")
               out.write(f"- Estimated total storage: **{estimated_total_bytes} bytes** ({report['estimatedTotalStorageGB']:.6f} GB / {report['estimatedTotalStorageGiB']:.6f} GiB)\n\n")
-              out.write("| Object key | Bytes | Last modified |\n")
-              out.write("|---|---:|---|\n")
+              out.write("| Object key | Bytes | Purpose | Last modified |\n")
+              out.write("|---|---:|---|---|\n")
               for item in objects:
                   key = item["key"].replace("|", "\\|")
-                  out.write(f"| \`{key}\` | {item['bytes']} | {item.get('lastModified') or ''} |\n")
+                  purpose_text = item["purpose"].replace("|", "\\|")
+                  out.write(f"| \`{key}\` | {item['bytes']} | {purpose_text} | {item.get('lastModified') or ''} |\n")
               if multipart:
                   out.write("\n### Incomplete multipart uploads\n\n")
                   out.write("| Object key | Parts | Bytes |\n")
