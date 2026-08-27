@@ -1,7 +1,7 @@
 name: R2 Checkpoint 25 GB Dry Run
 
-on:
-  workflow_dispatch:
+"on":
+  workflow_dispatch: {}
   pull_request:
     paths:
       - ".github/workflows/r2-checkpoint-dry-run.yml"
@@ -51,18 +51,31 @@ jobs:
       - name: Install S3-compatible client
         run: python3 -m pip install --disable-pip-version-check awscli
 
-      - name: Read-only inventory and checkpoint projection
+      - name: Validate immutable promotion architecture
         shell: bash
         run: |
           set -euo pipefail
-          output=$(bash scripts/r2-snapshot-store.sh checkpoint-preflight)
+          bash -n scripts/r2-snapshot-store.sh
+          checkpoint_body=$(sed -n '/^write_checkpoint()/,/^case /p' scripts/r2-snapshot-store.sh)
+          if grep -Eq 'delete-object|s3 rm|copy-object|s3 cp "s3://[^ ]+" "s3://' <<< "$checkpoint_body"; then
+            echo "::error::Checkpoint promotion still contains a destructive action or R2-to-R2 copy." >&2
+            exit 1
+          fi
+          grep -F 'checkpoint_versions_prefix' scripts/r2-snapshot-store.sh >/dev/null
+          grep -F 'latest_pointer_key' scripts/r2-snapshot-store.sh >/dev/null
+
+      - name: Read-only inventory and immutable checkpoint projection
+        shell: bash
+        run: |
+          set -euo pipefail
+          output=$(bash scripts/r2-snapshot-store.sh promotion-dry-run)
           printf '%s\n' "$output"
           {
-            echo "## 25 GB checkpoint dry-run"
+            echo "## Immutable checkpoint promotion dry-run"
             echo
             echo '```text'
             printf '%s\n' "$output"
             echo '```'
             echo
-            echo "No R2 object was uploaded, copied, replaced, or deleted."
+            echo "No R2 object was uploaded, copied, replaced, pointed to, or deleted."
           } >> "$GITHUB_STEP_SUMMARY"

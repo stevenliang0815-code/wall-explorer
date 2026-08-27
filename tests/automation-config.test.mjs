@@ -47,11 +47,19 @@ test("GitHub Actions persists every historical batch to R2 and resumes before re
   const workflow = await readFile(".github/workflows/historical-backfill.yml", "utf8");
   const restore = workflow.indexOf("r2-snapshot-store.sh restore");
   const build = workflow.indexOf("build-historical-snapshot.mjs");
-  const checkpoint = workflow.indexOf("r2-snapshot-store.sh checkpoint");
+  const checkpoint = workflow.lastIndexOf("r2-snapshot-store.sh checkpoint");
+  const checkpointStore = await readFile("scripts/r2-snapshot-store.sh", "utf8");
+  const promotion = checkpointStore.slice(
+    checkpointStore.indexOf("write_checkpoint()"),
+    checkpointStore.indexOf('case "$operation"'),
+  );
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /R2_ACCESS_KEY_ID: \$\{\{ secrets\.R2_ACCESS_KEY_ID \}\}/);
   assert.ok(restore >= 0 && restore < build, "R2 checkpoint must restore before the builder starts");
   assert.ok(checkpoint > build, "R2 checkpoint must upload after each builder batch");
+  assert.match(promotion, /checkpoint_versions_prefix/);
+  assert.match(promotion, /latest_pointer_key/);
+  assert.doesNotMatch(promotion, /delete-object|copy-object/);
   assert.match(workflow, /if: failure\(\)/);
   assert.doesNotMatch(workflow, /actions\/upload-artifact/);
 });

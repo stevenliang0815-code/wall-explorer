@@ -12,7 +12,11 @@ endpoint="https://${R2_ACCOUNT_ID:?R2_ACCOUNT_ID is required}.r2.cloudflarestora
 bucket="${R2_BUCKET:?R2_BUCKET is required}"
 hard_stop="${R2_STORAGE_LIMIT_BYTES:-25000000000}"
 reserve_bytes="${R2_FINALIZE_RESERVE_BYTES:-100000000}"
-raw_key="checkpoints/historical/builder.sqlite"
+legacy_raw_key="checkpoints/historical/builder.sqlite"
+checkpoint_pointer_key="checkpoints/historical/latest.json"
+checkpoint_versions_prefix="checkpoints/historical/versions/"
+raw_candidate_prefix="checkpoints/historical/candidates/"
+raw_key="$legacy_raw_key"
 raw_checksum_key="checksums/historical/builder.sqlite.sha256"
 status_key="jobs/historical/status.json"
 final_key="snapshots/historical/historical.sqlite.gz"
@@ -58,6 +62,74 @@ object_size() {
 
 remote_sha256() {
   r2 s3 cp "s3://${bucket}/$1" - --only-show-errors | sha256sum | awk '{print $1}'
+}
+
+resolve_raw_checkpoint() {
+  local pointer_file key bytes sha status candidates_file candidate_count
+  if object_exists "$checkpoint_pointer_key"; then
+    pointer_file=$(mktemp)
+    r2 s3 cp "s3://${bucket}/${checkpoint_pointer_key}" "$pointer_file" --only-show-errors
+    IFS=$'\t' read -r key bytes sha status < <(
+      python3 - "$pointer_file" "$checkpoint_versions_prefix" <<'PY'
+import json, sys
+pointer = json.load(open(sys.argv[1], encoding="utf-8"))
+prefix = sys.argv[2]
+key = str(pointer.get("objectKey", ""))
+if not key.startswith(prefix + "builder-") or not key.endswith(".sqlite"):
+    raise SystemExit("checkpoint pointer does not reference an immutable versioned SQLite object")
+sha = str(pointer.get("sha256", ""))
+if len(sha) != 64:
+    raise SystemExit("checkpoint pointer SHA-256 is invalid")
+print(key, int(pointer["bytes"]), sha, str(pointer["statusKey"]), sep="\t")
+PY
+    )
+    rm -f -- "$pointer_file"
+    object_exists "$key" || {
+      echo "::error::Checkpoint pointer references a missing raw object: $key" >&2
+      return 47
+    }
+    printf '%s\t%s\t%s\t%s\n' "$key" "$bytes" "$sha" "$status"
+    return
+  fi
+
+  if object_exists "$legacy_raw_key"; then
+    bytes=$(object_size "$legacy_raw_key")
+    sha="-"
+    if object_exists "$raw_checksum_key"; then
+      sha=$(r2 s3 cp "s3://${bucket}/${raw_checksum_key}" - --only-show-errors | tr -d '[:space:]')
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$legacy_raw_key" "$bytes" "$sha" "$status_key"
+    return
+  fi
+
+  candidates_file=$(mktemp)
+  r2 s3api list-objects-v2 --bucket "$bucket" --prefix "$raw_candidate_prefix" --output json > "$candidates_file"
+  IFS=$'\t' read -r candidate_count key < <(
+    python3 - "$candidates_file" <<'PY'
+import json, sys
+keys = [
+    item["Key"]
+    for item in json.load(open(sys.argv[1], encoding="utf-8")).get("Contents", [])
+    if item.get("Key", "").endswith("/builder.sqlite")
+]
+print(len(keys), keys[0] if len(keys) == 1 else "-", sep="\t")
+PY
+  )
+  rm -f -- "$candidates_file"
+  if [ "$candidate_count" -eq 1 ]; then
+    local candidate_checksum="${key}.sha256"
+    status="${key%/builder.sqlite}/status.json"
+    object_exists "$candidate_checksum" && object_exists "$status" || return 46
+    bytes=$(object_size "$key")
+    sha=$(r2 s3 cp "s3://${bucket}/${candidate_checksum}" - --only-show-errors | tr -d '[:space:]')
+    printf '%s\t%s\t%s\t%s\n' "$key" "$bytes" "$sha" "$status"
+    return
+  fi
+  [ "$candidate_count" -eq 0 ] || {
+    echo "::error::Multiple raw candidates exist; refusing to guess a recovery point." >&2
+    return 45
+  }
+  return 1
 }
 
 inventory_json() {
@@ -177,27 +249,29 @@ verify_remote_gzip() {
 }
 
 download_raw() {
+  local resolved expected_size expected_sha resolved_status actual_size actual_sha
   mkdir -p "$output_root"
-  object_exists "$raw_key" || {
+  resolved=$(resolve_raw_checkpoint) || {
     echo "::error::Canonical raw SQLite is missing." >&2
     exit 47
   }
+  IFS=$'\t' read -r raw_key expected_size expected_sha resolved_status <<< "$resolved"
   require_no_multipart
   r2 s3 cp "s3://${bucket}/${raw_key}" "$db_path" --only-show-errors
-  r2 s3 cp "s3://${bucket}/${status_key}" "$output_root/job-status.json" --only-show-errors
-  if object_exists "$raw_checksum_key"; then
-    r2 s3 cp "s3://${bucket}/${raw_checksum_key}" "$output_root/builder.sqlite.sha256" --only-show-errors
-    expected=$(tr -d '[:space:]' < "$output_root/builder.sqlite.sha256")
-    actual=$(sha256sum "$db_path" | awk '{print $1}')
-    test "$actual" = "$expected" || {
-      echo "::error::Downloaded raw SQLite does not match its stored SHA-256." >&2
+  r2 s3 cp "s3://${bucket}/${resolved_status}" "$output_root/job-status.json" --only-show-errors
+  actual_size=$(stat -c '%s' "$db_path")
+  test "$actual_size" -eq "$expected_size"
+  if [ "$expected_sha" != "-" ]; then
+    actual_sha=$(sha256sum "$db_path" | awk '{print $1}')
+    test "$actual_sha" = "$expected_sha" || {
+      echo "::error::Downloaded raw SQLite does not match the checkpoint pointer SHA-256." >&2
       exit 46
     }
   fi
 }
 
 is_finalized() {
-  if object_exists "$final_key" && object_exists "$manifest_key" && object_exists "$latest_pointer_key" && ! object_exists "$raw_key"; then
+  if object_exists "$final_key" && object_exists "$manifest_key" && object_exists "$latest_pointer_key"; then
     echo "finalized=true"
     return 0
   fi
@@ -206,9 +280,15 @@ is_finalized() {
 }
 
 is_ready() {
-  local status_json status progress current_date overall total
+  local status_json status progress current_date overall total resolved resolved_status
   status_json=$(mktemp)
-  if ! r2 s3 cp "s3://${bucket}/${status_key}" "$status_json" --only-show-errors; then
+  if ! resolved=$(resolve_raw_checkpoint); then
+    rm -f -- "$status_json"
+    echo "ready=false"
+    return 1
+  fi
+  IFS=$'\t' read -r _ _ _ resolved_status <<< "$resolved"
+  if ! r2 s3 cp "s3://${bucket}/${resolved_status}" "$status_json" --only-show-errors; then
     rm -f -- "$status_json"
     echo "ready=false"
     return 1
@@ -255,28 +335,28 @@ record_stop() {
 }
 
 preflight() {
-  local count raw_size
+  local count raw_size resolved
   require_no_multipart
   count=$(candidate_count)
   test "$count" -eq 0 || {
     echo "::error::A gzip candidate already exists; refusing to create an orphan chain." >&2
     return 45
   }
-  object_exists "$raw_key" || {
+  resolved=$(resolve_raw_checkpoint) || {
     echo "::error::Canonical raw SQLite is missing." >&2
     return 47
   }
+  IFS=$'\t' read -r raw_key raw_size _ _ <<< "$resolved"
   if object_exists "$final_key"; then
     echo "::error::Final gzip key already exists while raw SQLite is still present; refusing to overwrite." >&2
     return 45
   fi
-  raw_size=$(object_size "$raw_key")
   capacity_guard "$raw_size" "Conservative gzip allowance"
 }
 
 migrate() {
   local manifest_path="${4:?manifest path is required}" status_path="${5:?status path is required}"
-  local gzip_size gzip_sha raw_sha current_raw_sha count latest_pointer final_status
+  local gzip_size gzip_sha raw_sha current_raw_sha count latest_pointer final_status resolved
   test -f "$db_path"
   test -f "$gzip_path"
   test -f "$manifest_path"
@@ -293,6 +373,8 @@ migrate() {
     echo "::error::A gzip candidate already exists; stopping without changing raw SQLite." >&2
     exit 45
   }
+  resolved=$(resolve_raw_checkpoint)
+  IFS=$'\t' read -r raw_key _ _ _ <<< "$resolved"
   object_exists "$raw_key"
   ! object_exists "$final_key" || {
     echo "::error::Final gzip already exists; refusing to overwrite it." >&2
