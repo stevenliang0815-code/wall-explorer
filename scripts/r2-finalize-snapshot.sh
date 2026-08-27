@@ -15,6 +15,7 @@ reserve_bytes="${R2_FINALIZE_RESERVE_BYTES:-100000000}"
 legacy_raw_key="checkpoints/historical/builder.sqlite"
 checkpoint_pointer_key="checkpoints/historical/latest.json"
 checkpoint_versions_prefix="checkpoints/historical/versions/"
+raw_candidate_prefix="checkpoints/historical/candidates/"
 raw_key="$legacy_raw_key"
 raw_checksum_key="checksums/historical/builder.sqlite.sha256"
 status_key="jobs/historical/status.json"
@@ -64,7 +65,7 @@ remote_sha256() {
 }
 
 resolve_raw_checkpoint() {
-  local pointer_file key bytes sha status
+  local pointer_file key bytes sha status candidates_file candidate_count
   if object_exists "$checkpoint_pointer_key"; then
     pointer_file=$(mktemp)
     r2 s3 cp "s3://${bucket}/${checkpoint_pointer_key}" "$pointer_file" --only-show-errors
@@ -91,13 +92,44 @@ PY
     return
   fi
 
-  object_exists "$legacy_raw_key" || return 1
-  bytes=$(object_size "$legacy_raw_key")
-  sha="-"
-  if object_exists "$raw_checksum_key"; then
-    sha=$(r2 s3 cp "s3://${bucket}/${raw_checksum_key}" - --only-show-errors | tr -d '[:space:]')
+  if object_exists "$legacy_raw_key"; then
+    bytes=$(object_size "$legacy_raw_key")
+    sha="-"
+    if object_exists "$raw_checksum_key"; then
+      sha=$(r2 s3 cp "s3://${bucket}/${raw_checksum_key}" - --only-show-errors | tr -d '[:space:]')
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$legacy_raw_key" "$bytes" "$sha" "$status_key"
+    return
   fi
-  printf '%s\t%s\t%s\t%s\n' "$legacy_raw_key" "$bytes" "$sha" "$status_key"
+
+  candidates_file=$(mktemp)
+  r2 s3api list-objects-v2 --bucket "$bucket" --prefix "$raw_candidate_prefix" --output json > "$candidates_file"
+  IFS=$'\t' read -r candidate_count key < <(
+    python3 - "$candidates_file" <<'PY'
+import json, sys
+keys = [
+    item["Key"]
+    for item in json.load(open(sys.argv[1], encoding="utf-8")).get("Contents", [])
+    if item.get("Key", "").endswith("/builder.sqlite")
+]
+print(len(keys), keys[0] if len(keys) == 1 else "-", sep="\t")
+PY
+  )
+  rm -f -- "$candidates_file"
+  if [ "$candidate_count" -eq 1 ]; then
+    local candidate_checksum="${key}.sha256"
+    status="${key%/builder.sqlite}/status.json"
+    object_exists "$candidate_checksum" && object_exists "$status" || return 46
+    bytes=$(object_size "$key")
+    sha=$(r2 s3 cp "s3://${bucket}/${candidate_checksum}" - --only-show-errors | tr -d '[:space:]')
+    printf '%s\t%s\t%s\t%s\n' "$key" "$bytes" "$sha" "$status"
+    return
+  fi
+  [ "$candidate_count" -eq 0 ] || {
+    echo "::error::Multiple raw candidates exist; refusing to guess a recovery point." >&2
+    return 45
+  }
+  return 1
 }
 
 inventory_json() {

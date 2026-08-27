@@ -167,6 +167,32 @@ resolve_checkpoint() {
     return
   fi
 
+  local candidate_list candidate_count candidate_checkpoint candidate_checksum candidate_status
+  candidate_list=$(candidate_db_keys)
+  candidate_count=$(printf '%s\n' "$candidate_list" | sed '/^$/d' | wc -l)
+  if [ "$candidate_count" -eq 1 ]; then
+    candidate_checkpoint=$(printf '%s\n' "$candidate_list" | sed '/^$/d')
+    candidate_checksum="${candidate_checkpoint}.sha256"
+    candidate_status="${candidate_checkpoint%/builder.sqlite}/status.json"
+    object_exists "$candidate_checksum" || {
+      echo "::error::The retained candidate has no checksum sidecar." >&2
+      return 46
+    }
+    object_exists "$candidate_status" || {
+      echo "::error::The retained candidate has no status sidecar." >&2
+      return 46
+    }
+    bytes=$(object_size "$candidate_checkpoint")
+    sha=$(r2 s3 cp "s3://${bucket}/${candidate_checksum}" - --only-show-errors | tr -d '[:space:]')
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$candidate_checkpoint" "$bytes" "$sha" "$candidate_status" "-" "verified-legacy-candidate"
+    return
+  fi
+  if [ "$candidate_count" -gt 1 ]; then
+    echo "::error::Multiple retained candidates exist; refusing to guess the active checkpoint." >&2
+    return 45
+  fi
+
   return 1
 }
 
@@ -303,7 +329,7 @@ PY
       return 45
     }
   fi
-  echo "Safe to start a checkpoint upload now: $safe"
+  echo "Storage-safe for one immutable checkpoint upload: $safe"
 }
 
 validate_local_checkpoint() {
