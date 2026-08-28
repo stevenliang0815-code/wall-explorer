@@ -94,10 +94,22 @@ jobs:
                   return "retained legacy candidate raw SQLite"
               if key.startswith("checkpoints/historical/versions/") and key.endswith(".sqlite"):
                   return "immutable versioned raw SQLite"
+              if key.startswith("snapshots/historical/versions/") and key.endswith(".sqlite.gz"):
+                  return "immutable verified compressed Snapshot"
               if key == "checkpoints/historical/latest.json":
                   return "small canonical checkpoint pointer"
+              if key == "snapshots/historical/latest.json":
+                  return "small published Snapshot pointer"
               if key == "jobs/historical/stop.json":
                   return "durable pause / stop marker"
+              if key == "jobs/historical/state.json":
+                  return "durable lifecycle state machine"
+              if key == "jobs/historical/lease.json":
+                  return "durable single-writer lease"
+              if key in ("jobs/historical/pending-checkpoint.json", "jobs/historical/pending-snapshot.json"):
+                  return "idempotent pending operation descriptor"
+              if key.startswith("jobs/historical/uploads/"):
+                  return "multipart upload ID and completed-parts state"
               if key.endswith(".sha256"):
                   return "checksum metadata"
               if key.endswith("status.json"):
@@ -112,6 +124,7 @@ jobs:
               [{
                   "key": item["Key"],
                   "bytes": int(item["Size"]),
+                  "etag": item.get("ETag"),
                   "lastModified": item.get("LastModified"),
                   "purpose": purpose(item["Key"]),
               } for item in objects_data.get("Contents", [])],
@@ -155,12 +168,13 @@ jobs:
               out.write(f"- Incomplete multipart uploads: **{len(multipart)}**\n")
               out.write(f"- Incomplete multipart bytes: **{multipart_bytes}**\n")
               out.write(f"- Estimated total storage: **{estimated_total_bytes} bytes** ({report['estimatedTotalStorageGB']:.6f} GB / {report['estimatedTotalStorageGiB']:.6f} GiB)\n\n")
-              out.write("| Object key | Bytes | Purpose | Last modified |\n")
-              out.write("|---|---:|---|---|\n")
+              out.write("| Object key | Bytes | ETag | Purpose | Last modified |\n")
+              out.write("|---|---:|---|---|---|\n")
               for item in objects:
                   key = item["key"].replace("|", "\\|")
                   purpose_text = item["purpose"].replace("|", "\\|")
-                  out.write(f"| \`{key}\` | {item['bytes']} | {purpose_text} | {item.get('lastModified') or ''} |\n")
+                  etag = str(item.get("etag") or "").replace("|", "\\|")
+                  out.write(f"| \`{key}\` | {item['bytes']} | {etag} | {purpose_text} | {item.get('lastModified') or ''} |\n")
               if multipart:
                   out.write("\n### Incomplete multipart uploads\n\n")
                   out.write("| Object key | Parts | Bytes |\n")

@@ -1,10 +1,7 @@
-name: R2 Compression Dry Run
+name: R2 Compression Read-only Dry Run
 
-on:
-  push:
-    paths:
-      - ".github/workflows/r2-compression-dry-run.yml"
-  workflow_dispatch:
+"on":
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -16,172 +13,43 @@ concurrency:
 jobs:
   dry-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
-      AWS_DEFAULT_REGION: auto
-      AWS_EC2_METADATA_DISABLED: "true"
-      AWS_PAGER: ""
-      SOURCE_KEY: checkpoints/historical/builder.sqlite
-      CHECKSUM_KEY: checksums/historical/builder.sqlite.sha256
-      STATUS_KEY: jobs/historical/status.json
-      SOFT_LIMIT_BYTES: "9800000000"
-      HARD_LIMIT_BYTES: "10000000000"
+      R2_STORAGE_LIMIT_BYTES: "25000000000"
+      R2_SAFETY_RESERVE_BYTES: "100000000"
+      SNAPSHOT_OUTPUT_ROOT: snapshot-output
+      SNAPSHOT_VERSION: 2026-08-17-v1
 
     steps:
-      - name: Validate secret names without printing values
+      - uses: actions/checkout@v4
+      - run: python3 -m pip install --disable-pip-version-check awscli
+      - name: Resolve and restore the verified raw source without mutation
+        run: |
+          set -euo pipefail
+          resolved=$(bash scripts/r2-checkpoint-lifecycle.sh resolve)
+          printf '%s\n' "$resolved" > /tmp/resolved.json
+          bash scripts/r2-checkpoint-lifecycle.sh restore
+      - name: Validate raw and measure deterministic gzip
         shell: bash
         run: |
           set -euo pipefail
-          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
-            if [ -z "${!key:-}" ]; then
-              echo "Required GitHub secret is missing: $key" >&2
-              exit 1
-            fi
-          done
-
-      - name: Install S3-compatible client
-        run: python3 -m pip install --disable-pip-version-check awscli
-
-      - name: Read inventory and download checkpoint to ephemeral disk
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
-        run: |
-          set -euo pipefail
-          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-
-          aws --endpoint-url "$endpoint" s3api list-objects-v2             --bucket "$R2_BUCKET" --output json > /tmp/r2-objects.json
-
-          python3 - <<'PY'
-          import json
-          data = json.load(open("/tmp/r2-objects.json", encoding="utf-8"))
-          objects = data.get("Contents", [])
-          source = "checkpoints/historical/builder.sqlite"
-          matching = [item for item in objects if item["Key"] == source]
-          if len(matching) != 1:
-              raise SystemExit(f"Expected exactly one checkpoint, found {len(matching)}")
-          wal_like = [
-              item["Key"] for item in objects
-              if item["Key"].startswith(source) and item["Key"] != source
-          ]
-          if wal_like:
-              raise SystemExit(f"Checkpoint has associated WAL-like objects: {wal_like}")
-          json.dump({
-              "objectBytes": sum(int(item["Size"]) for item in objects),
-              "sourceBytes": int(matching[0]["Size"]),
-              "objectCount": len(objects),
-          }, open("/tmp/r2-capacity.json", "w", encoding="utf-8"))
+          db="snapshot-output/historical-2026-08-17.building/historical.sqlite"
+          test -f "$db"
+          expected_sha=$(node -e 'const d=require("/tmp/resolved.json");process.stdout.write(d.sha256)' 2>/dev/null || python3 -c 'import json;print(json.load(open("/tmp/resolved.json"))["sha256"])')
+          [ "$expected_sha" = "-" ] || test "$(sha256sum "$db" | awk '{print $1}')" = "$expected_sha"
+          test "$(python3 - "$db" <<'PY'
+          import sqlite3,sys
+          c=sqlite3.connect(f"file:{sys.argv[1]}?mode=ro",uri=True); print(c.execute("PRAGMA integrity_check").fetchone()[0]); c.close()
           PY
-
-          aws --endpoint-url "$endpoint" s3 cp             "s3://${R2_BUCKET}/${SOURCE_KEY}" /tmp/builder.sqlite             --only-show-errors
-          aws --endpoint-url "$endpoint" s3 cp             "s3://${R2_BUCKET}/${CHECKSUM_KEY}" /tmp/builder.sqlite.sha256             --only-show-errors
-          aws --endpoint-url "$endpoint" s3 cp             "s3://${R2_BUCKET}/${STATUS_KEY}" /tmp/job-status.json             --only-show-errors
-
-      - name: Verify checksum and SQLite integrity
-        shell: bash
-        run: |
-          set -euo pipefail
-          expected_sha256=$(awk '{print $1}' /tmp/builder.sqlite.sha256)
-          actual_sha256=$(sha256sum /tmp/builder.sqlite | awk '{print $1}')
-          if [ "$expected_sha256" != "$actual_sha256" ]; then
-            echo "Source checksum mismatch." >&2
-            exit 1
-          fi
-          printf '%s' "$actual_sha256" > /tmp/source.sha256
-
-          python3 - <<'PY'
-          import json, sqlite3
-          from pathlib import Path
-
-          con = sqlite3.connect("file:/tmp/builder.sqlite?mode=ro", uri=True)
-          integrity = [row[0] for row in con.execute("PRAGMA integrity_check")]
-          if integrity != ["ok"]:
-              raise SystemExit(f"SQLite integrity_check failed: {integrity[:10]}")
-          rows = con.execute("SELECT count(*) FROM historical_observations").fetchone()[0]
-          completed = con.execute(
-              "SELECT count(*) FROM builder_checkpoints WHERE status='completed'"
-          ).fetchone()[0]
-          failed = con.execute(
-              "SELECT count(*) FROM builder_checkpoints WHERE status='failed'"
-          ).fetchone()[0]
-          user_version = con.execute("PRAGMA user_version").fetchone()[0]
-          con.close()
-
-          status = json.load(open("/tmp/job-status.json", encoding="utf-8"))
-          result = {
-              "integrityCheck": "ok",
-              "sqliteUserVersion": user_version,
-              "databaseRows": rows,
-              "completedUnits": completed,
-              "failedUnits": failed,
-              "jobStatus": status.get("status"),
-              "jobProgress": status.get("progress"),
-              "jobStoredRows": status.get("storedRows"),
-              "jobCurrentDate": status.get("currentDate"),
-          }
-          Path("/tmp/database-validation.json").write_text(
-              json.dumps(result, ensure_ascii=False), encoding="utf-8"
-          )
-          print("SQLITE_VALIDATION=" + json.dumps(result, ensure_ascii=False))
-          PY
-
-      - name: Measure lossless gzip and verify round trip
-        shell: bash
-        run: |
-          set -euo pipefail
-          gzip -9 -c /tmp/builder.sqlite > /tmp/builder.sqlite.gz
+          )" = ok
+          gzip -9n -c "$db" > /tmp/builder.sqlite.gz
           gzip -t /tmp/builder.sqlite.gz
-
-          source_sha256=$(cat /tmp/source.sha256)
-          restored_sha256=$(gzip -dc /tmp/builder.sqlite.gz | sha256sum | awk '{print $1}')
-          if [ "$source_sha256" != "$restored_sha256" ]; then
-            echo "Round-trip checksum mismatch." >&2
-            exit 1
-          fi
-
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          capacity = json.load(open("/tmp/r2-capacity.json", encoding="utf-8"))
-          validation = json.load(open("/tmp/database-validation.json", encoding="utf-8"))
-          source_bytes = Path("/tmp/builder.sqlite").stat().st_size
-          compressed_bytes = Path("/tmp/builder.sqlite.gz").stat().st_size
-          current_bytes = int(capacity["objectBytes"])
-          soft_limit = 9_800_000_000
-          hard_limit = 10_000_000_000
-          peak_bytes = current_bytes + compressed_bytes
-          final_bytes = current_bytes - source_bytes + compressed_bytes
-
-          report = {
-              "status": "dry_run_complete",
-              **validation,
-              "currentR2Bytes": current_bytes,
-              "sourceBytes": source_bytes,
-              "compressedBytes": compressed_bytes,
-              "savedBytes": source_bytes - compressed_bytes,
-              "compressionRatio": round(compressed_bytes / source_bytes, 8),
-              "estimatedPeakBytesIfUploadedBeforeDelete": peak_bytes,
-              "estimatedFinalBytesAfterVerifiedReplace": final_bytes,
-              "softLimitBytes": soft_limit,
-              "hardLimitBytes": hard_limit,
-              "peakBelowSoftLimit": peak_bytes < soft_limit,
-              "peakBelowHardLimit": peak_bytes < hard_limit,
-              "gzipTest": "ok",
-              "roundTripSha256": "match",
-          }
-          print("R2_COMPRESSION_DRY_RUN=" + json.dumps(
-              report, ensure_ascii=False, separators=(",", ":")
-          ))
-          with open(Path.home() / "dry-run-summary.md", "w", encoding="utf-8") as out:
-              out.write("## R2 compression dry-run\n\n")
-              for key, value in report.items():
-                  out.write(f"- {key}: **{value}**\n")
-          PY
-
-          cat "$HOME/dry-run-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          test "$(gzip -dc /tmp/builder.sqlite.gz | sha256sum | awk '{print $1}')" = "$(sha256sum "$db" | awk '{print $1}')"
+          gzip_bytes=$(stat -c '%s' /tmp/builder.sqlite.gz)
+          bash scripts/r2-checkpoint-lifecycle.sh projected-peak "$gzip_bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Deterministic gzip bytes: $gzip_bytes" >> "$GITHUB_STEP_SUMMARY"
+          echo "No R2 object, pointer, multipart upload, lease, or state was mutated." >> "$GITHUB_STEP_SUMMARY"

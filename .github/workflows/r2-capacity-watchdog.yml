@@ -54,7 +54,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          usage_json=$(bash scripts/r2-snapshot-store.sh usage-json)
+          usage_json=$(bash scripts/r2-checkpoint-lifecycle.sh usage-json)
           read -r object_bytes multipart_bytes multipart_uploads usage_bytes < <(
             python3 - "$usage_json" <<'PY'
           import json, sys
@@ -106,8 +106,8 @@ jobs:
             --cache-control no-store \
             --only-show-errors
 
-      - name: Stop historical jobs when unsafe
-        if: steps.usage.outcome == 'failure' || steps.usage.outputs.over_limit == 'true'
+      - name: Stop historical jobs only when measured usage is unsafe
+        if: steps.usage.outputs.over_limit == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -123,8 +123,7 @@ jobs:
                 gh run cancel "$run_id" --repo "${GITHUB_REPOSITORY}"
               done
 
-      - name: Fail closed when usage cannot be measured
+      - name: Warn when usage cannot be measured
         if: steps.usage.outcome == 'failure'
         run: |
-          echo "R2 usage could not be verified; historical jobs were stopped safely." >&2
-          exit 1
+          echo "::warning::R2 usage could not be measured. The watchdog did not cancel or mutate a historical job; each large writer still has its own fail-closed preflight."

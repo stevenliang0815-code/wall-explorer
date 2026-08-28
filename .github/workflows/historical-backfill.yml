@@ -1,26 +1,16 @@
 name: Historical Snapshot Backfill
 
-on:
+"on":
   workflow_dispatch:
     inputs:
-      mode:
-        description: Start or retry from the durable R2 checkpoint
-        required: true
-        default: resume
-        type: choice
-        options:
-          - resume
-          - retry
       batch_dates:
-        description: Calendar dates per durable checkpoint batch
-        required: true
+        description: Dates processed per in-run batch
+        required: false
         default: "2"
       max_cycles:
-        description: Checkpoint batches in this run; 0 uses the full server window
-        required: true
-        default: "1"
-  schedule:
-    - cron: "17 * * * *"
+        description: Optional canary limit; 0 runs until checkpoint cadence is due
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -32,7 +22,6 @@ concurrency:
 
 jobs:
   backfill:
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 330
     env:
@@ -40,243 +29,76 @@ jobs:
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
-      R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
-      WALL_EXPLORER_URL: ${{ vars.WALL_EXPLORER_URL }}
-      OAI_SITES_AUTHORIZATION: ${{ secrets.OAI_SITES_AUTHORIZATION }}
+      R2_STORAGE_LIMIT_BYTES: "25000000000"
+      R2_SAFETY_RESERVE_BYTES: "100000000"
       SNAPSHOT_OUTPUT_ROOT: snapshot-output
       SNAPSHOT_VERSION: 2026-08-17-v1
-      R2_STORAGE_LIMIT_BYTES: "25000000000"
-      R2_NEXT_BATCH_RESERVE_BYTES: "100000000"
-      R2_ALLOW_LEGACY_PUBLISH: "false"
-      GH_TOKEN: ${{ github.token }}
-      AWS_MAX_ATTEMPTS: "3"
-      AWS_RETRY_MODE: standard
+      BATCH_DATES: ${{ inputs.batch_dates || '2' }}
+      MAX_CYCLES: ${{ inputs.max_cycles || '0' }}
 
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22.13.0"
-          cache: npm
-
-      - name: Install project dependencies
-        run: npm ci
-
-      - name: Install the S3-compatible client
-        run: python3 -m pip install --disable-pip-version-check awscli
-
-      - name: Validate required secret configuration
+      - name: Install builder and R2 clients
+        run: |
+          bash scripts/install-ci.sh
+          python3 -m pip install --disable-pip-version-check awscli
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do test -n "${!key:-}"; done
+          bash -n scripts/r2-historical-common.sh
+          bash -n scripts/r2-checkpoint-lifecycle.sh
+      - name: Keep durable pause authoritative
+        id: pause
         shell: bash
         run: |
           set -euo pipefail
-          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
-            if [ -z "${!key:-}" ]; then
-              echo "Required GitHub secret is missing: $key" >&2
-              exit 1
-            fi
-          done
-
-      - name: Check whether final gzip is already complete
-        id: final_state
-        shell: bash
-        run: |
-          if bash scripts/r2-finalize-snapshot.sh is-finalized; then
-            echo "finalized=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "finalized=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Check durable stop marker
-        id: stop_state
-        if: steps.final_state.outputs.finalized != 'true'
-        shell: bash
-        run: |
-          if bash scripts/r2-finalize-snapshot.sh is-stopped; then
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" AWS_DEFAULT_REGION=auto AWS_EC2_METADATA_DISABLED=true AWS_PAGER=""
+          if aws --endpoint-url "$endpoint" s3api head-object --bucket "$R2_BUCKET" --key jobs/historical/stop.json >/dev/null 2>&1; then
             echo "stopped=true" >> "$GITHUB_OUTPUT"
-            echo "A durable stop marker exists; automatic backfill remains blocked." >> "$GITHUB_STEP_SUMMARY"
+            echo "Historical backfill remains paused; no runner or upload started." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "stopped=false" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Preflight the next durable checkpoint
-        if: steps.final_state.outputs.finalized != 'true' && steps.stop_state.outputs.stopped != 'true'
-        id: preflight
-        shell: bash
-        run: |
-          set -euo pipefail
-          if bash scripts/r2-snapshot-store.sh checkpoint-preflight; then
-            echo "safe=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "safe=false" >> "$GITHUB_OUTPUT"
-            {
-              echo "## Backfill stopped before execution"
-              echo
-              echo "The projected checkpoint peak is unsafe or an unfinished candidate/multipart upload exists."
-              echo "The existing 95.16% builder.sqlite remains untouched in R2."
-              echo "R2 hard stop remains exactly 25,000,000,000 bytes."
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Restore the last durable checkpoint
-        if: steps.final_state.outputs.finalized != 'true' && steps.stop_state.outputs.stopped != 'true' && steps.preflight.outputs.safe == 'true'
-        run: bash scripts/r2-snapshot-store.sh restore
-
-      - name: Resume server-side historical batches
-        if: steps.final_state.outputs.finalized != 'true' && steps.stop_state.outputs.stopped != 'true' && steps.preflight.outputs.safe == 'true'
+      - name: Acquire durable lifecycle lease
+        if: steps.pause.outputs.stopped != 'true'
+        run: bash scripts/r2-checkpoint-lifecycle.sh acquire-lease "backfill-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" backfill
+      - name: Restore only the current verified checkpoint
+        if: steps.pause.outputs.stopped != 'true'
+        run: bash scripts/r2-checkpoint-lifecycle.sh restore
+      - name: Backfill in-run until checkpoint cadence is due
+        if: steps.pause.outputs.stopped != 'true'
         id: builder
         shell: bash
-        env:
-          BATCH_DATES: ${{ inputs.batch_dates || '2' }}
-          MAX_CYCLES: ${{ github.event_name == 'workflow_dispatch' && inputs.max_cycles || '0' }}
         run: |
           set -euo pipefail
-          started_at=$SECONDS
           cycles=0
-          while [ $((SECONDS - started_at)) -lt 18000 ]; do
+          due=false
+          baseline="snapshot-output/restored-status.json"
+          [ -f "$baseline" ] || baseline="-"
+          while [ "$due" != true ]; do
             cycles=$((cycles + 1))
-
-            usage_before=$(bash scripts/r2-snapshot-store.sh usage-bytes)
-            echo "R2 bytes before batch: $usage_before"
-            if [ "$usage_before" -ge "$R2_STORAGE_LIMIT_BYTES" ]; then
-              echo "::error::R2 is at the 25 GB hard stop; no batch was started."
-              exit 42
-            fi
-
             node --experimental-strip-types scripts/build-historical-snapshot.mjs \
-              --start 2010-01-04 \
-              --end 2025-12-28 \
-              --snapshot-cutoff 2026-08-17 \
-              --continuation-cursor 2025-12-28 \
-              --continuation-rows 152052 \
-              --continuation-units 464 \
-              --total-units 12140 \
-              --workers 2 \
-              --max-dates "$BATCH_DATES" \
-              --output "$SNAPSHOT_OUTPUT_ROOT"
-
-            bash scripts/r2-snapshot-store.sh checkpoint
-
-            usage_after=$(bash scripts/r2-snapshot-store.sh usage-bytes)
-            echo "R2 bytes after checkpoint: $usage_after"
-            if [ "$usage_after" -ge "$R2_STORAGE_LIMIT_BYTES" ]; then
-              echo "::error::R2 reached the 25 GB hard stop; no further batch will start."
-              exit 44
-            fi
-
-            state=$(node -e "const s=require('./snapshot-output/job-status.json'); process.stdout.write(s.status)")
-            if [ "$state" = "complete" ]; then
-              echo "complete=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            if [ "$MAX_CYCLES" -gt 0 ] && [ "$cycles" -ge "$MAX_CYCLES" ]; then
-              echo "Canary limit reached after $cycles durable checkpoint batch(es)."
+              --start 2010-01-04 --end 2025-12-28 --snapshot-cutoff 2026-08-17 \
+              --continuation-cursor 2025-12-28 --continuation-rows 152052 --continuation-units 464 \
+              --total-units 12140 --workers 2 --max-dates "$BATCH_DATES" --output "$SNAPSHOT_OUTPUT_ROOT"
+            decision=$(node scripts/historical-lifecycle.mjs checkpoint-due snapshot-output/job-status.json "$baseline")
+            due=$(node -e 'const d=JSON.parse(process.argv[1]);process.stdout.write(String(d.due))' "$decision")
+            reason=$(node -e 'const d=JSON.parse(process.argv[1]);process.stdout.write(d.reason)' "$decision")
+            echo "Checkpoint cadence: due=$due reason=$reason cycle=$cycles"
+            if [ "$MAX_CYCLES" -gt 0 ] && [ "$cycles" -ge "$MAX_CYCLES" ] && [ "$due" != true ]; then
+              echo "Canary ended before checkpoint cadence; no large R2 upload was created." >> "$GITHUB_STEP_SUMMARY"
               break
             fi
           done
-          echo "complete=false" >> "$GITHUB_OUTPUT"
-
-      - name: Validate the completed raw Snapshot
-        if: steps.final_state.outputs.finalized != 'true' && steps.stop_state.outputs.stopped != 'true' && steps.builder.outputs.complete == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          db="snapshot-output/historical-2026-08-17.building/historical.sqlite"
-          if [ ! -f "$db" ]; then
-            db="snapshot-output/historical-2026-08-17/historical.sqlite"
-          fi
-          test -f "$db"
-          command -v sqlite3 >/dev/null || {
-            sudo apt-get update
-            sudo apt-get install -y sqlite3
-          }
-          sqlite3 "$db" 'PRAGMA wal_checkpoint(TRUNCATE);'
-          integrity=$(sqlite3 "$db" 'PRAGMA integrity_check;')
-          test "$integrity" = "ok"
-          db_rows=$(sqlite3 "$db" 'SELECT count(*) FROM historical_observations;')
-          duplicate_rows=$(sqlite3 "$db" "SELECT count(*) FROM (SELECT market,code,trading_date,count(*) n FROM historical_observations GROUP BY market,code,trading_date HAVING n>1);")
-          open_failures=$(sqlite3 "$db" "SELECT count(*) FROM builder_checkpoints WHERE status!='completed';")
-          survivorship_violations=$(sqlite3 "$db" "SELECT count(*) FROM historical_observations WHERE source_scope!='full_market_daily';")
-          lookahead_violations=$(sqlite3 "$db" "SELECT count(*) FROM historical_observations WHERE substr(usable_from,1,10)<=trading_date;")
-          test "$duplicate_rows" -eq 0
-          test "$open_failures" -eq 0
-          test "$survivorship_violations" -eq 0
-          test "$lookahead_violations" -eq 0
-          read -r status_name progress stored_rows continuation_rows < <(
-            node -e "const s=require('./snapshot-output/job-status.json'); console.log(s.status,s.progress,s.storedRows,s.continuationRows??0)"
-          )
-          test "$status_name" = "complete"
-          test "$progress" = "100"
-          test $((db_rows + continuation_rows)) -eq "$stored_rows"
-          raw_sha=$(sha256sum "$db" | awk '{print $1}')
-          raw_bytes=$(stat -c '%s' "$db")
-          gzip -9n -c "$db" > "$RUNNER_TEMP/builder.sqlite.gz"
-          gzip -t "$RUNNER_TEMP/builder.sqlite.gz"
-          roundtrip_sha=$(gzip -dc "$RUNNER_TEMP/builder.sqlite.gz" | sha256sum | awk '{print $1}')
-          test "$roundtrip_sha" = "$raw_sha"
-          gzip_bytes=$(stat -c '%s' "$RUNNER_TEMP/builder.sqlite.gz")
-          status=$(node -e "const s=require('./snapshot-output/job-status.json'); process.stdout.write(JSON.stringify({status:s.status,progress:s.progress,storedRows:s.storedRows,currentDate:s.currentDate,overallCompletedUnits:s.overallCompletedUnits,totalUnits:s.totalUnits}))")
-          {
-            echo "## Completed Snapshot validation"
-            echo
-            echo "- SQLite integrity: ok"
-            echo "- SQLite rows: $db_rows"
-            echo "- Stored rows including continuation: $stored_rows"
-            echo "- Progress: $progress%"
-            echo "- Failed/incomplete units: $open_failures"
-            echo "- Duplicate rows: $duplicate_rows"
-            echo "- Survivorship violations: $survivorship_violations"
-            echo "- Look-ahead violations: $lookahead_violations"
-            echo "- Raw bytes: $raw_bytes"
-            echo "- Raw SHA-256: $raw_sha"
-            echo "- Gzip level: 9"
-            echo "- Gzip bytes: $gzip_bytes"
-            echo "- gzip -t: pass"
-            echo "- Decompressed SHA-256: match"
-            echo "- Status: \`$status\`"
-            echo "- R2 raw-to-gzip replacement: not performed by this validation step"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Keep legacy duplicate publishing blocked
-        if: steps.final_state.outputs.finalized != 'true' && steps.stop_state.outputs.stopped != 'true' && steps.builder.outputs.complete == 'true'
-        run: |
-          echo "Final gzip was validated locally. Automatic raw deletion/replacement remains blocked pending a dedicated migration gate."
-
-      - name: Confirm R2 recovery policy
-        if: always()
-        shell: bash
-        run: |
-          {
-            echo "## R2 recovery policy"
-            echo
-            echo "- R2 hard stop: 25,000,000,000 bytes"
-            echo "- Projected peak includes completed objects, unfinished multipart parts, next raw checkpoint, and reserve"
-            echo "- Old canonical is retained until a candidate upload passes exact size and SHA-256 verification"
-            echo "- At most one candidate chain is permitted"
-            echo "- AWS client attempts are bounded at 3"
-            echo "- Legacy duplicate Snapshot publishing remains blocked"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Record preflight stop and notify owner
-        if: steps.final_state.outputs.finalized != 'true' && steps.stop_state.outputs.stopped != 'true' && steps.preflight.outputs.safe == 'false'
-        shell: bash
-        run: |
-          set -euo pipefail
-          reason="Projected peak, unfinished multipart, or orphan candidate blocked the next checkpoint."
-          bash scripts/r2-finalize-snapshot.sh record-stop "$reason"
-          gh issue create \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Historical Snapshot stopped — preflight — run $GITHUB_RUN_ID" \
-            --body "Automatic backfill stopped before any new checkpoint write. Reason: $reason The last verified R2 recovery point was retained. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-
-      - name: Record unexpected stop and notify owner
+          echo "checkpoint_due=$due" >> "$GITHUB_OUTPUT"
+      - name: Upload one immutable pending checkpoint
+        if: steps.pause.outputs.stopped != 'true' && steps.builder.outputs.checkpoint_due == 'true'
+        run: bash scripts/r2-checkpoint-lifecycle.sh upload
+      - name: Release durable lifecycle lease
+        if: always() && steps.pause.outputs.stopped != 'true'
+        run: bash scripts/r2-checkpoint-lifecycle.sh release-lease "backfill-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: Record failure without moving the canonical pointer
         if: failure()
-        shell: bash
-        run: |
-          set -u
-          reason="Historical backfill failed or a validation gate stopped the run."
-          bash scripts/r2-finalize-snapshot.sh record-stop "$reason" || true
-          gh issue create \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Historical Snapshot stopped — run $GITHUB_RUN_ID" \
-            --body "The automatic flow stopped and will not auto-resume while the durable stop marker exists. The last verified R2 recovery point was retained. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" || true
+        run: bash scripts/r2-checkpoint-lifecycle.sh record-stop "Backfill/checkpoint upload failed in run ${GITHUB_RUN_ID}; the last verified canonical was retained."
