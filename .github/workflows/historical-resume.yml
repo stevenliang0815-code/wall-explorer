@@ -1,5 +1,7 @@
 name: Resume Historical Snapshot Backfill
 
+# Re-run the full read-only resume gate after fixing CI shell wrapper execution.
+
 "on":
   push:
     branches: [main]
