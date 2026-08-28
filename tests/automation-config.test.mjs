@@ -41,6 +41,11 @@ test("snapshot builder is an independent resumable SQLite job", async () => {
   assert.match(builder, /--max-dates/);
   assert.match(builder, /continuationRows/);
   assert.match(builder, /job-status\.json/);
+  assert.match(builder, /validated_empty/);
+  assert.match(builder, /failed_transient/);
+  assert.match(builder, /failed_hard/);
+  assert.match(builder, /failedUnitDetails/);
+  assert.match(builder, /Cross-market completeness gate/);
 });
 
 test("Backfill restores first and uploads one pending immutable checkpoint without promotion", async () => {
