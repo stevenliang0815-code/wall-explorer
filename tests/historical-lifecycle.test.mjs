@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { execFile as execFileCallback } from "node:child_process";
+import { promisify } from "node:util";
 import test from "node:test";
 
 import {
@@ -12,6 +14,8 @@ import {
   snapshotPointer,
   transitionState,
 } from "../scripts/historical-lifecycle.mjs";
+
+const execFile = promisify(execFileCallback);
 
 test("durable lifecycle exposes every required state", () => {
   assert.deepEqual(STATES, [
@@ -27,6 +31,28 @@ test("state transitions advance and reject unsafe skips", () => {
   assert.equal(next.runId, "12");
   assert.throws(() => assertTransition("BACKFILLING", "COMPLETE"), /Illegal/);
   assert.equal(assertTransition("CHECKPOINT_PROMOTING", "CHECKPOINT_PROMOTING"), true);
+});
+
+test("shell state transition forwards JSON patches without an extra closing brace", async () => {
+  const { stdout } = await execFile("bash", ["-c", String.raw`
+    set -euo pipefail
+    source scripts/r2-historical-common.sh
+    object_exists() { return 1; }
+    put_json_cas() { cat "$1"; }
+    state_transition CHECKPOINT_UPLOADING '{"cleanupPending":false,"upload":{"objectKey":"raw-new"}}'
+  `], {
+    env: {
+      ...process.env,
+      R2_ACCOUNT_ID: "test",
+      R2_BUCKET: "test",
+      R2_ACCESS_KEY_ID: "test",
+      R2_SECRET_ACCESS_KEY: "test",
+    },
+  });
+  const state = JSON.parse(stdout);
+  assert.equal(state.state, "CHECKPOINT_UPLOADING");
+  assert.equal(state.cleanupPending, false);
+  assert.equal(state.upload.objectKey, "raw-new");
 });
 
 test("projected peak counts objects, multipart parts, remaining upload, and reserve", () => {
