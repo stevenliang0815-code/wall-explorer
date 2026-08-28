@@ -28,7 +28,9 @@ jobs:
       R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
       R2_STORAGE_LIMIT_BYTES: "25000000000"
       R2_SAFETY_RESERVE_BYTES: "100000000"
-      ENABLE_HISTORICAL_BACKFILL: ${{ vars.ENABLE_HISTORICAL_BACKFILL || 'false' }}
+      # The owner explicitly authorized uninterrupted continuation to 100%.
+      # The state gate below still prevents another Backfill after RAW_100_PERCENT.
+      ENABLE_HISTORICAL_BACKFILL: "true"
       GH_TOKEN: ${{ github.token }}
 
     steps:
