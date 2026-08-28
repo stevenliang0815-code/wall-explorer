@@ -130,6 +130,13 @@ test("R2 lifecycle uses CAS, explicit multipart abort, cleanup gate, and immutab
   assert.doesNotMatch(`${checkpoint}\n${finalize}`, /copy-object|s3 cp "s3:\/\/[^ ]+" "s3:\//);
 });
 
+test("dry-run measures pending promotion without simulating a forbidden third raw", async () => {
+  const workflow = await readFile(".github/workflows/r2-checkpoint-dry-run.yml", "utf8");
+  assert.match(workflow, /pending-checkpoint\.json/);
+  assert.match(workflow, /expected_bytes=0/);
+  assert.match(workflow, /forbidden third raw/);
+});
+
 test("watchdog measurement failure warns without cancelling a running Backfill", async () => {
   const watchdog = await readFile(".github/workflows/r2-capacity-watchdog.yml", "utf8");
   assert.match(watchdog, /Stop historical jobs only when measured usage is unsafe/);
