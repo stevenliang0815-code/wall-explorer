@@ -54,11 +54,13 @@ test("Backfill restores first and uploads one pending immutable checkpoint witho
   const build = workflow.indexOf("build-historical-snapshot.mjs");
   const checkpoint = workflow.lastIndexOf("r2-checkpoint-lifecycle.sh upload");
   assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /actions: write/);
   assert.match(workflow, /R2_ACCESS_KEY_ID: \$\{\{ secrets\.R2_ACCESS_KEY_ID \}\}/);
   assert.ok(restore >= 0 && restore < build, "R2 checkpoint must restore before the builder starts");
   assert.ok(checkpoint > build, "R2 checkpoint must upload after each builder batch");
   assert.doesNotMatch(workflow, /r2-checkpoint-lifecycle\.sh promote|r2-finalize-lifecycle\.sh|r2-historical-gc\.sh/);
   assert.match(workflow, /if: failure\(\)/);
+  assert.match(workflow, /gh workflow run historical-checkpoint-promotion\.yml/);
   assert.doesNotMatch(workflow, /actions\/upload-artifact/);
 });
 
@@ -68,6 +70,9 @@ test("Promotion, Finalize, and GC have separate large-object responsibilities", 
   const gc = await readFile(".github/workflows/historical-garbage-collection.yml", "utf8");
   for (const workflow of [promotion, finalize, gc]) assert.match(workflow, /group: wall-explorer-historical-snapshot/);
   assert.match(promotion, /r2-checkpoint-lifecycle\.sh promote/);
+  assert.match(promotion, /pending-checkpoint\.json/);
+  assert.match(promotion, /steps\.pause\.outputs\.pending == 'true'/);
+  assert.match(promotion, /paths: \[\.github\/workflows\/historical-checkpoint-promotion\.yml\]/);
   assert.doesNotMatch(promotion, /build-historical-snapshot|r2-finalize-lifecycle|r2-historical-gc/);
   assert.match(finalize, /r2-finalize-lifecycle\.sh finalize/);
   assert.doesNotMatch(finalize, /build-historical-snapshot|r2-checkpoint-lifecycle\.sh promote|r2-historical-gc/);
