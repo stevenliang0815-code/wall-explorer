@@ -1,0 +1,140 @@
+name: Resume Historical Snapshot Backfill
+
+"on":
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/historical-resume.yml"
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: wall-explorer-historical-snapshot
+  cancel-in-progress: false
+
+jobs:
+  resume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+      R2_STORAGE_LIMIT_BYTES: "25000000000"
+      R2_SAFETY_RESERVE_BYTES: "100000000"
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install read-only R2 client
+        run: python3 -m pip install --disable-pip-version-check awscli
+
+      - name: Re-run static lifecycle safety gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
+            test -n "${!key:-}"
+          done
+          bash -n scripts/r2-historical-common.sh scripts/r2-checkpoint-lifecycle.sh scripts/r2-finalize-lifecycle.sh scripts/r2-historical-gc.sh
+          node --test tests/historical-lifecycle.test.mjs
+          ! grep -R -E 'copy-object|s3 cp "s3://[^ ]+" "s3://' scripts/r2-*-lifecycle.sh scripts/r2-historical-common.sh
+          grep -F -- '--if-match' scripts/r2-historical-common.sh
+          grep -F -- '--if-none-match' scripts/r2-historical-common.sh
+          grep -F 'abort-multipart-upload' scripts/r2-historical-common.sh
+          grep -F 'cleanupPending' scripts/r2-historical-common.sh
+
+      - name: Final read-only R2 gate
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/r2-historical-common.sh
+
+          object_exists "$stop_key" || {
+            echo "::error::Expected durable stop marker is absent; refusing an ambiguous resume."
+            exit 43
+          }
+          object_exists "$pending_checkpoint_key" && {
+            echo "::error::A pending checkpoint exists; promotion must finish before resume."
+            exit 45
+          }
+
+          if object_exists "$lease_key"; then
+            lease_file=$(mktemp)
+            download_object "$lease_key" "$lease_file"
+            read -r lease_status lease_expires < <(python3 - "$lease_file" <<'PY'
+          import json,sys
+          d=json.load(open(sys.argv[1])); print(d.get("status","active"),int(d.get("expiresEpoch",0)))
+          PY
+          )
+            rm -f -- "$lease_file"
+            now=$(date -u +%s)
+            if [ "$lease_status" = active ] && [ "$lease_expires" -gt "$now" ]; then
+              echo "::error::An active lifecycle lease exists; refusing to start a second writer."
+              exit 45
+            fi
+          fi
+
+          resolved=$(bash scripts/r2-checkpoint-lifecycle.sh resolve)
+          source_type=$(node -e 'const d=JSON.parse(process.argv[1]);process.stdout.write(d.source)' "$resolved")
+          bytes=$(node -e 'const d=JSON.parse(process.argv[1]);process.stdout.write(String(d.bytes))' "$resolved")
+          case "$source_type" in
+            verified-legacy-candidate|versioned-pointer) ;;
+            *) echo "::error::Resume source is not a verified recoverable checkpoint: $source_type"; exit 46 ;;
+          esac
+
+          usage=$(bash scripts/r2-checkpoint-lifecycle.sh usage-json)
+          read -r uploads multipart < <(node -e 'const d=JSON.parse(process.argv[1]);console.log(d.multipartUploads,d.multipartBytes)' "$usage")
+          test "$uploads" -eq 0 && test "$multipart" -eq 0 || {
+            echo "::error::Unfinished multipart data exists; resume blocked."
+            exit 45
+          }
+
+          bash scripts/r2-checkpoint-lifecycle.sh projected-peak "$bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          gc_plan=$(bash scripts/r2-historical-gc.sh plan)
+          printf '%s\n' "$gc_plan" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$gc_plan" | grep -q '^delete=0\| delete=0\|keep=[0-9][0-9]* delete=0 '
+          printf '%s\n' "$gc_plan" | grep -q '^ABORT MULTIPART LIST$'
+
+          echo "source_type=$source_type" >> "$GITHUB_OUTPUT"
+          echo "checkpoint_bytes=$bytes" >> "$GITHUB_OUTPUT"
+
+      - name: Remove only the durable pause marker and dispatch Backfill
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/r2-historical-common.sh
+          stop_backup=$(mktemp)
+          download_object "$stop_key" "$stop_backup"
+
+          restore_stop_on_error() {
+            code=$?
+            if ! object_exists "$stop_key"; then
+              put_json_cas "$stop_backup" "$stop_key" ABSENT || true
+            fi
+            rm -f -- "$stop_backup"
+            exit "$code"
+          }
+          trap restore_stop_on_error ERR
+
+          r2_destructive s3api delete-object --bucket "$bucket" --key "$stop_key" >/dev/null
+          ! object_exists "$stop_key"
+          gh workflow run historical-backfill.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            --field batch_dates=2 \
+            --field max_cycles=0
+
+          trap - ERR
+          rm -f -- "$stop_backup"
+          {
+            echo "Historical Backfill resumed from ${{ steps.gate.outputs.source_type }}."
+            echo "Checkpoint bytes: ${{ steps.gate.outputs.checkpoint_bytes }}."
+            echo "Automatic checkpoint promotion, continuation to 100%, and Finalize are enabled."
+          } >> "$GITHUB_STEP_SUMMARY"

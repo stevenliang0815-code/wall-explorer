@@ -71,6 +71,28 @@ test("Promotion, Finalize, and GC have separate large-object responsibilities", 
   assert.doesNotMatch(gc, /build-historical-snapshot|r2-finalize-lifecycle\.sh finalize/);
 });
 
+test("authorized resume fails closed, removes only the stop marker, and enables continuation", async () => {
+  const resume = await readFile(".github/workflows/historical-resume.yml", "utf8");
+  const promotion = await readFile(".github/workflows/historical-checkpoint-promotion.yml", "utf8");
+  const gate = resume.indexOf("Final read-only R2 gate");
+  const remove = resume.indexOf('delete-object --bucket "$bucket" --key "$stop_key"');
+  const dispatch = resume.indexOf("gh workflow run historical-backfill.yml");
+
+  assert.match(resume, /push:\n\s+branches: \[main\]/);
+  assert.doesNotMatch(resume, /workflow_dispatch/);
+  assert.match(resume, /group: wall-explorer-historical-snapshot/);
+  assert.match(resume, /Expected durable stop marker is absent/);
+  assert.match(resume, /multipartUploads,d\.multipartBytes/);
+  assert.match(resume, /r2-checkpoint-lifecycle\.sh projected-peak/);
+  assert.match(resume, /r2-historical-gc\.sh plan/);
+  assert.match(resume, /put_json_cas "\$stop_backup" "\$stop_key" ABSENT/);
+  assert.ok(gate >= 0 && gate < remove && remove < dispatch, "all gates must pass before the exact stop marker is removed and Backfill is dispatched");
+  const deleteLines = resume.split("\n").filter((line) => line.includes("delete-object")).join("\n");
+  assert.doesNotMatch(deleteLines, /builder\.sqlite|candidate|checkpoint/);
+  assert.match(promotion, /ENABLE_HISTORICAL_BACKFILL: "true"/);
+  assert.match(promotion, /\[ "\$state" != BACKFILLING \] \|\| gh workflow run historical-backfill\.yml/);
+});
+
 test("R2 lifecycle uses CAS, explicit multipart abort, cleanup gate, and immutable keys", async () => {
   const common = await readFile("scripts/r2-historical-common.sh", "utf8");
   const checkpoint = await readFile("scripts/r2-checkpoint-lifecycle.sh", "utf8");
