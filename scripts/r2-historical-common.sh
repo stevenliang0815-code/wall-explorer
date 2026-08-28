@@ -206,7 +206,8 @@ PY
 }
 
 state_transition() {
-  local to="$1" patch_json="${2:-{}}" dir current next etag
+  local to="$1" patch_json="${2-}" dir current next etag
+  [ -n "$patch_json" ] || patch_json='{}'
   dir=$(mktemp -d)
   current="$dir/current.json"
   next="$dir/next.json"
