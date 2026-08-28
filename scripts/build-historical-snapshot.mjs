@@ -6,7 +6,7 @@ import { basename, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pipeline } from "node:stream/promises";
 import { createGzip, gzipSync } from "node:zlib";
-import { auditBiasGuards, BACKFILL_POLICY, fetchHistoricalMarketDay } from "../lib/historical-data.ts";
+import { auditBiasGuards, BACKFILL_POLICY, classifyHistoricalUnitError, fetchHistoricalMarketDay, HistoricalUnitError } from "../lib/historical-data.ts";
 import { SNAPSHOT_FORMAT, SNAPSHOT_SCHEMA_VERSION } from "../lib/historical-snapshot.ts";
 
 const args = new Map();
@@ -65,25 +65,29 @@ const insert = db.prepare(`
     change=excluded.change, volume=excluded.volume, trade_value=excluded.trade_value,
     source=excluded.source, source_scope=excluded.source_scope, usable_from=excluded.usable_from
 `);
-const checkpoint = db.prepare(`
+const resolveUnit = db.prepare(`
   INSERT INTO builder_checkpoints (market,trading_date,status,rows_written,attempts,last_error,updated_at)
-  VALUES (?,?,'completed',?,1,NULL,?)
-  ON CONFLICT(market,trading_date) DO UPDATE SET status='completed',rows_written=excluded.rows_written,last_error=NULL,updated_at=excluded.updated_at
+  VALUES (?,?,?,?,?,?,?)
+  ON CONFLICT(market,trading_date) DO UPDATE SET status=excluded.status,rows_written=excluded.rows_written,attempts=builder_checkpoints.attempts+excluded.attempts,last_error=excluded.last_error,updated_at=excluded.updated_at
 `);
 const failure = db.prepare(`
   INSERT INTO builder_checkpoints (market,trading_date,status,rows_written,attempts,last_error,updated_at)
-  VALUES (?,?,'failed',0,1,?,?)
-  ON CONFLICT(market,trading_date) DO UPDATE SET status='failed',attempts=builder_checkpoints.attempts+1,last_error=excluded.last_error,updated_at=excluded.updated_at
+  VALUES (?,?,?,0,?,?,?)
+  ON CONFLICT(market,trading_date) DO UPDATE SET status=excluded.status,attempts=builder_checkpoints.attempts+excluded.attempts,last_error=excluded.last_error,updated_at=excluded.updated_at
 `);
 const completed = db.prepare("SELECT status FROM builder_checkpoints WHERE market=? AND trading_date=?");
 const completedDay = db.prepare("SELECT market,rows_written rowsWritten,status FROM builder_checkpoints WHERE trading_date=?");
+const isResolvedStatus = (status) => status === "completed" || status === "validated_empty";
 
 async function writeJobStatus(status, currentDate = null, lastError = null) {
   const counts = db.prepare(`SELECT
-    sum(CASE WHEN status='completed' THEN 1 ELSE 0 END) completedUnits,
-    sum(CASE WHEN status='failed' THEN 1 ELSE 0 END) failedUnits,
-    coalesce(sum(CASE WHEN status='completed' THEN rows_written ELSE 0 END),0) rowsWritten
+    sum(CASE WHEN status IN ('completed','validated_empty') THEN 1 ELSE 0 END) completedUnits,
+    sum(CASE WHEN status='validated_empty' THEN 1 ELSE 0 END) validatedEmptyUnits,
+    sum(CASE WHEN status LIKE 'failed_%' OR status='failed' THEN 1 ELSE 0 END) failedUnits,
+    coalesce(sum(CASE WHEN status IN ('completed','validated_empty') THEN rows_written ELSE 0 END),0) rowsWritten
     FROM builder_checkpoints`).get();
+  const failedUnitDetails = db.prepare(`SELECT market,trading_date tradingDate,status,attempts,last_error lastError
+    FROM builder_checkpoints WHERE status LIKE 'failed_%' OR status='failed' ORDER BY trading_date,market`).all();
   const segmentTotalUnits = allDates.length * markets.length;
   const completedUnits = Number(counts.completedUnits ?? 0);
   const totalUnits = declaredTotalUnits || continuationUnits + segmentTotalUnits;
@@ -95,7 +99,8 @@ async function writeJobStatus(status, currentDate = null, lastError = null) {
     storedRows: continuationRows + Number(counts.rowsWritten ?? 0), completedUnits,
     segmentTotalUnits, overallCompletedUnits, totalUnits,
     progress: Number((overallCompletedUnits / Math.max(1, totalUnits) * 100).toFixed(2)),
-    failedUnits: Number(counts.failedUnits ?? 0), lastError,
+    validatedEmptyUnits: Number(counts.validatedEmptyUnits ?? 0),
+    failedUnits: Number(counts.failedUnits ?? 0), failedUnitDetails, lastError,
   };
   await writeFile(statusPath, `${JSON.stringify(body, null, 2)}\n`);
   return body;
@@ -113,11 +118,11 @@ function* datesBetween(first, last) {
     cursor.setUTCDate(cursor.getUTCDate() + 1);
   }
 }
-function saveUnit(market, date, rows) {
+function saveUnit(market, date, rows, status = "completed", reason = null, attempts = 1) {
   db.exec("BEGIN IMMEDIATE");
   try {
     for (const row of rows) insert.run(row.market,row.code,row.name,row.tradingDate,row.securityType,row.universeStatus,row.open,row.high,row.low,row.close,row.change,row.volume,row.tradeValue,row.source,row.sourceScope,row.usableFrom);
-    checkpoint.run(market, date, rows.length, new Date().toISOString());
+    resolveUnit.run(market, date, status, rows.length, Math.max(1, attempts), reason, new Date().toISOString());
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");
@@ -125,22 +130,31 @@ function saveUnit(market, date, rows) {
   }
 }
 async function buildUnit(market, date) {
-  if (completed.get(market, date)?.status === "completed") return null;
-  if (isWeekend(date)) { saveUnit(market, date, []); return null; }
+  if (isResolvedStatus(completed.get(market, date)?.status)) return null;
+  if (isWeekend(date)) {
+    saveUnit(market, date, [], "validated_empty", "weekend-calendar");
+    return { rows: 0, unitStatus: "validated_empty", profile: { networkMs: 0, parseMs: 0, retryCount: 0, throttledMs: 0 } };
+  }
   try {
     const result = await fetchHistoricalMarketDay(market, date);
     const audit = auditBiasGuards(result.observations, date);
-    if (audit.survivorship.status !== "pass" || audit.lookAhead.status !== "pass") throw new Error("Bias validation blocked the official batch");
-    saveUnit(market, date, result.observations);
-    return { rows: result.observations.length, profile: result.profile };
+    if (audit.survivorship.status !== "pass" || audit.lookAhead.status !== "pass") throw new HistoricalUnitError("integrity", "Bias validation blocked the official batch");
+    saveUnit(market, date, result.observations, result.unitStatus, result.emptyReason, result.profile.attempts);
+    console.log(JSON.stringify({ event: "unit_resolved", market, tradingDate: date, status: result.unitStatus, rows: result.observations.length, attempts: result.profile.attempts, retries: result.profile.retryCount, emptyReason: result.emptyReason }));
+    return { rows: result.observations.length, unitStatus: result.unitStatus, profile: result.profile };
   } catch (error) {
-    failure.run(market, date, error instanceof Error ? error.message.slice(0, 800) : "Unknown error", new Date().toISOString());
-    return null;
+    const classified = classifyHistoricalUnitError(error);
+    const failureStatus = classified.retryable ? "failed_transient" : "failed_hard";
+    const message = `[${classified.category}] ${classified.message}`.slice(0, 800);
+    const profile = error?.fetchProfile ?? { networkMs: 0, parseMs: 0, retryCount: 0, throttledMs: 0, attempts: 0 };
+    failure.run(market, date, failureStatus, Math.max(1, profile.attempts ?? 0), message, new Date().toISOString());
+    console.error(JSON.stringify({ event: "unit_failed", market, tradingDate: date, status: failureStatus, category: classified.category, retryable: classified.retryable, message, attempts: profile.attempts ?? 0, retries: profile.retryCount ?? 0 }));
+    return { rows: 0, unitStatus: failureStatus, profile };
   }
 }
 
 const allDates = [...datesBetween(start, end)];
-const pendingDates = allDates.filter((date) => markets.some((market) => completed.get(market, date)?.status !== "completed"));
+const pendingDates = allDates.filter((date) => markets.some((market) => !isResolvedStatus(completed.get(market, date)?.status)));
 const batchDates = pendingDates.slice(0, maxDates);
 const startedAt = Date.now();
 const runtime = { datesCompleted: 0, rowsWritten: 0, networkMs: 0, parseMs: 0, retries: 0, throttledMs: 0 };
@@ -155,11 +169,12 @@ async function processDate(date) {
     runtime.throttledMs += result.profile.throttledMs;
   }
   const day = completedDay.all(date);
-  if (day.length === markets.length && day.every((unit) => unit.status === "completed")) {
+  if (day.length === markets.length && day.every((unit) => isResolvedStatus(unit.status))) {
     const positive = day.filter((unit) => unit.rowsWritten > 0);
     if (positive.length === 1) {
       const empty = day.find((unit) => unit.rowsWritten === 0);
-      failure.run(empty.market, date, "Cross-market completeness gate: the other market has rows but this market is empty", new Date().toISOString());
+      failure.run(empty.market, date, "failed_hard", 1, "[integrity] Cross-market completeness gate: the other market has rows but this market is empty", new Date().toISOString());
+      console.error(JSON.stringify({ event: "unit_failed", market: empty.market, tradingDate: date, status: "failed_hard", category: "integrity", retryable: false, message: "Cross-market completeness gate: the other market has rows but this market is empty" }));
     }
   }
   runtime.datesCompleted += 1;
@@ -182,18 +197,21 @@ await Promise.all(Array.from({ length: Math.min(workers, batchDates.length) }, a
   }
 }));
 
-const failedAfterBatch = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status='failed'").get().count;
+const failedAfterBatch = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status LIKE 'failed_%' OR status='failed'").get().count;
 if (failedAfterBatch > 0) {
   db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-  const state = await writeJobStatus("failed", batchDates.at(-1) ?? null, `${failedAfterBatch} historical unit(s) failed; automatic continuation is blocked.`);
+  const hardFailures = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status='failed_hard' OR status='failed'").get().count;
+  const message = hardFailures > 0
+    ? `${hardFailures} historical unit(s) hit parsing/schema/integrity hard-stop.`
+    : `${failedAfterBatch} historical unit(s) remained unavailable after bounded exponential retry.`;
+  const state = await writeJobStatus("failed", batchDates.at(-1) ?? null, message);
   db.close();
   console.log(JSON.stringify(state));
-  throw new Error(`Historical batch stopped after ${failedAfterBatch} failed unit(s). The last verified R2 checkpoint remains the recovery point.`);
+  throw new Error(`${message} The last verified R2 checkpoint remains the recovery point.`);
 }
 
-const remainingUnits = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status!='completed'").get().count
-  + allDates.reduce((sum, date) => sum + markets.filter((market) => !completed.get(market, date)).length, 0);
-const completedUnits = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status='completed'").get().count;
+const remainingUnits = allDates.reduce((sum, date) => sum + markets.filter((market) => !isResolvedStatus(completed.get(market, date)?.status)).length, 0);
+const completedUnits = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status IN ('completed','validated_empty')").get().count;
 if (completedUnits < allDates.length * markets.length) {
   db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
   const state = await writeJobStatus(remainingUnits > 0 ? "retrying" : "running", batchDates.at(-1) ?? null);
@@ -202,7 +220,7 @@ if (completedUnits < allDates.length * markets.length) {
   process.exit(0);
 }
 
-const openFailures = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status='failed'").get().count;
+const openFailures = db.prepare("SELECT count(*) count FROM builder_checkpoints WHERE status LIKE 'failed_%' OR status='failed'").get().count;
 const duplicates = db.prepare("SELECT count(*) count FROM (SELECT market,code,trading_date,count(*) n FROM historical_observations GROUP BY market,code,trading_date HAVING n>1)").get().count;
 const survivorshipViolations = db.prepare("SELECT count(*) count FROM historical_observations WHERE source_scope!='full_market_daily'").get().count;
 const lookAheadViolations = db.prepare("SELECT count(*) count FROM historical_observations WHERE substr(usable_from,1,10)<=trading_date").get().count;
@@ -284,4 +302,3 @@ await writeFile(statusPath, `${JSON.stringify({
   releaseDir,
 }, null, 2)}\n`);
 console.log(JSON.stringify({ status: "complete", releaseDir, snapshotVersion: check.snapshotVersion, rows: check.rowCount, chunks: check.chunks.length, sqliteBytes: check.sqlite.bytes }));
-

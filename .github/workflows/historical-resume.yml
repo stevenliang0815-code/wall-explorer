@@ -2,6 +2,7 @@ name: Resume Historical Snapshot Backfill
 
 # Re-run the full read-only resume gate after fixing CI shell wrapper execution.
 # Re-run it again after fixing JSON patch forwarding before multipart creation.
+# Re-run after adding classified failed-unit hole repair for 2025-04-17.
 
 "on":
   push:
