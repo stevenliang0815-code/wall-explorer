@@ -13,6 +13,7 @@ name: Historical Snapshot Backfill
         default: "0"
 
 permissions:
+  actions: write
   contents: read
   issues: write
 
@@ -99,6 +100,11 @@ jobs:
       - name: Release durable lifecycle lease
         if: always() && steps.pause.outputs.stopped != 'true'
         run: bash scripts/r2-checkpoint-lifecycle.sh release-lease "backfill-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: Explicitly dispatch checkpoint promotion
+        if: success() && steps.pause.outputs.stopped != 'true' && steps.builder.outputs.checkpoint_due == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run historical-checkpoint-promotion.yml --repo "$GITHUB_REPOSITORY" --ref main
       - name: Record failure without moving the canonical pointer
         if: failure()
         run: bash scripts/r2-checkpoint-lifecycle.sh record-stop "Backfill/checkpoint upload failed in run ${GITHUB_RUN_ID}; the last verified canonical was retained."
