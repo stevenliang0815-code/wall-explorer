@@ -93,6 +93,17 @@ test("authorized resume fails closed, removes only the stop marker, and enables 
   assert.match(promotion, /\[ "\$state" != BACKFILLING \] \|\| gh workflow run historical-backfill\.yml/);
 });
 
+test("CI wrappers do not require the environment helper to have an executable bit", async () => {
+  for (const script of ["install-ci.sh", "build-verified.sh", "validate-artifact.sh"]) {
+    const source = await readFile(`scripts/${script}`, "utf8");
+    assert.match(source, /exec bash "\$\{script_dir\}\/sites-env\.sh" -- bash "\$0" "\$@"/);
+    assert.doesNotMatch(source, /exec "\$\{script_dir\}\/sites-env\.sh"/);
+  }
+  const build = await readFile("scripts/build-verified.sh", "utf8");
+  assert.match(build, /bash "\$\{script_dir\}\/validate-artifact\.sh"/);
+  assert.doesNotMatch(build, /^"\$\{script_dir\}\/validate-artifact\.sh"/m);
+});
+
 test("R2 lifecycle uses CAS, explicit multipart abort, cleanup gate, and immutable keys", async () => {
   const common = await readFile("scripts/r2-historical-common.sh", "utf8");
   const checkpoint = await readFile("scripts/r2-checkpoint-lifecycle.sh", "utf8");
