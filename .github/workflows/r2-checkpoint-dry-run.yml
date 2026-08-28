@@ -1,81 +1,64 @@
-name: R2 Checkpoint 25 GB Dry Run
+name: Historical Lifecycle Dry Run
 
 "on":
   workflow_dispatch: {}
   pull_request:
     paths:
+      - ".github/workflows/historical-*.yml"
       - ".github/workflows/r2-checkpoint-dry-run.yml"
-      - ".github/workflows/historical-backfill.yml"
-      - "scripts/r2-snapshot-store.sh"
+      - "scripts/historical-lifecycle.mjs"
+      - "scripts/r2-*-lifecycle.sh"
+      - "scripts/r2-historical-*.sh"
+      - "tests/historical-lifecycle.test.mjs"
   push:
     paths:
+      - ".github/workflows/historical-*.yml"
       - ".github/workflows/r2-checkpoint-dry-run.yml"
-      - ".github/workflows/historical-backfill.yml"
-      - "scripts/r2-snapshot-store.sh"
+      - "scripts/historical-lifecycle.mjs"
+      - "scripts/r2-*-lifecycle.sh"
+      - "scripts/r2-historical-*.sh"
+      - "tests/historical-lifecycle.test.mjs"
 
 permissions:
   contents: read
 
 concurrency:
-  group: wall-explorer-r2-checkpoint-dry-run
+  group: wall-explorer-historical-lifecycle-dry-run
   cancel-in-progress: true
 
 jobs:
   dry-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
       R2_STORAGE_LIMIT_BYTES: "25000000000"
-      R2_NEXT_BATCH_RESERVE_BYTES: "100000000"
-      AWS_MAX_ATTEMPTS: "3"
-      AWS_RETRY_MODE: standard
+      R2_SAFETY_RESERVE_BYTES: "100000000"
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Validate required configuration
-        shell: bash
+      - name: Static architecture and failure tests
         run: |
           set -euo pipefail
-          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
-            if [ -z "${!key:-}" ]; then
-              echo "Required GitHub secret is missing: $key" >&2
-              exit 1
-            fi
-          done
-
-      - name: Install S3-compatible client
+          bash -n scripts/r2-historical-common.sh scripts/r2-checkpoint-lifecycle.sh scripts/r2-finalize-lifecycle.sh scripts/r2-historical-gc.sh
+          node --test tests/historical-lifecycle.test.mjs
+          ! grep -R -E 'copy-object|s3 cp "s3://[^ ]+" "s3://' scripts/r2-*-lifecycle.sh scripts/r2-historical-common.sh
+          grep -F -- '--if-match' scripts/r2-historical-common.sh
+          grep -F -- '--if-none-match' scripts/r2-historical-common.sh
+          grep -F 'abort-multipart-upload' scripts/r2-historical-common.sh
+          grep -F 'cleanupPending' scripts/r2-historical-common.sh
+      - name: Install read-only R2 client
         run: python3 -m pip install --disable-pip-version-check awscli
-
-      - name: Validate immutable promotion architecture
+      - name: Read-only measured peak and GC plan
+        if: env.R2_ACCOUNT_ID != '' && env.R2_ACCESS_KEY_ID != '' && env.R2_SECRET_ACCESS_KEY != '' && env.R2_BUCKET != ''
         shell: bash
         run: |
           set -euo pipefail
-          bash -n scripts/r2-snapshot-store.sh
-          checkpoint_body=$(sed -n '/^write_checkpoint()/,/^case /p' scripts/r2-snapshot-store.sh)
-          if grep -Eq 'delete-object|s3 rm|copy-object|s3 cp "s3://[^ ]+" "s3://' <<< "$checkpoint_body"; then
-            echo "::error::Checkpoint promotion still contains a destructive action or R2-to-R2 copy." >&2
-            exit 1
-          fi
-          grep -F 'checkpoint_versions_prefix' scripts/r2-snapshot-store.sh >/dev/null
-          grep -F 'latest_pointer_key' scripts/r2-snapshot-store.sh >/dev/null
-
-      - name: Read-only inventory and immutable checkpoint projection
-        shell: bash
-        run: |
-          set -euo pipefail
-          output=$(bash scripts/r2-snapshot-store.sh promotion-dry-run)
-          printf '%s\n' "$output"
-          {
-            echo "## Immutable checkpoint promotion dry-run"
-            echo
-            echo '```text'
-            printf '%s\n' "$output"
-            echo '```'
-            echo
-            echo "No R2 object was uploaded, copied, replaced, pointed to, or deleted."
-          } >> "$GITHUB_STEP_SUMMARY"
+          resolved=$(bash scripts/r2-checkpoint-lifecycle.sh resolve)
+          bytes=$(node -e 'const d=JSON.parse(process.argv[1]);process.stdout.write(String(d.bytes))' "$resolved")
+          bash scripts/r2-checkpoint-lifecycle.sh projected-peak "$bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          bash scripts/r2-historical-gc.sh plan | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "No object, pointer, state, lease, multipart upload, or Backfill job was mutated." >> "$GITHUB_STEP_SUMMARY"

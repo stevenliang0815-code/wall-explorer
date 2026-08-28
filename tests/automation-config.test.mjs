@@ -43,25 +43,55 @@ test("snapshot builder is an independent resumable SQLite job", async () => {
   assert.match(builder, /job-status\.json/);
 });
 
-test("GitHub Actions persists every historical batch to R2 and resumes before rebuilding", async () => {
+test("Backfill restores first and uploads one pending immutable checkpoint without promotion", async () => {
   const workflow = await readFile(".github/workflows/historical-backfill.yml", "utf8");
-  const restore = workflow.indexOf("r2-snapshot-store.sh restore");
+  const restore = workflow.indexOf("r2-checkpoint-lifecycle.sh restore");
   const build = workflow.indexOf("build-historical-snapshot.mjs");
-  const checkpoint = workflow.lastIndexOf("r2-snapshot-store.sh checkpoint");
-  const checkpointStore = await readFile("scripts/r2-snapshot-store.sh", "utf8");
-  const promotion = checkpointStore.slice(
-    checkpointStore.indexOf("write_checkpoint()"),
-    checkpointStore.indexOf('case "$operation"'),
-  );
+  const checkpoint = workflow.lastIndexOf("r2-checkpoint-lifecycle.sh upload");
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /R2_ACCESS_KEY_ID: \$\{\{ secrets\.R2_ACCESS_KEY_ID \}\}/);
   assert.ok(restore >= 0 && restore < build, "R2 checkpoint must restore before the builder starts");
   assert.ok(checkpoint > build, "R2 checkpoint must upload after each builder batch");
-  assert.match(promotion, /checkpoint_versions_prefix/);
-  assert.match(promotion, /latest_pointer_key/);
-  assert.doesNotMatch(promotion, /delete-object|copy-object/);
+  assert.doesNotMatch(workflow, /r2-checkpoint-lifecycle\.sh promote|r2-finalize-lifecycle\.sh|r2-historical-gc\.sh/);
   assert.match(workflow, /if: failure\(\)/);
   assert.doesNotMatch(workflow, /actions\/upload-artifact/);
+});
+
+test("Promotion, Finalize, and GC have separate large-object responsibilities", async () => {
+  const promotion = await readFile(".github/workflows/historical-checkpoint-promotion.yml", "utf8");
+  const finalize = await readFile(".github/workflows/historical-finalize.yml", "utf8");
+  const gc = await readFile(".github/workflows/historical-garbage-collection.yml", "utf8");
+  for (const workflow of [promotion, finalize, gc]) assert.match(workflow, /group: wall-explorer-historical-snapshot/);
+  assert.match(promotion, /r2-checkpoint-lifecycle\.sh promote/);
+  assert.doesNotMatch(promotion, /build-historical-snapshot|r2-finalize-lifecycle|r2-historical-gc/);
+  assert.match(finalize, /r2-finalize-lifecycle\.sh finalize/);
+  assert.doesNotMatch(finalize, /build-historical-snapshot|r2-checkpoint-lifecycle\.sh promote|r2-historical-gc/);
+  assert.match(gc, /r2-historical-gc\.sh plan/);
+  assert.match(gc, /GC_APPLY: "true"/);
+  assert.doesNotMatch(gc, /build-historical-snapshot|r2-finalize-lifecycle\.sh finalize/);
+});
+
+test("R2 lifecycle uses CAS, explicit multipart abort, cleanup gate, and immutable keys", async () => {
+  const common = await readFile("scripts/r2-historical-common.sh", "utf8");
+  const checkpoint = await readFile("scripts/r2-checkpoint-lifecycle.sh", "utf8");
+  const finalize = await readFile("scripts/r2-finalize-lifecycle.sh", "utf8");
+  assert.match(common, /--if-match/);
+  assert.match(common, /--if-none-match/);
+  assert.match(common, /abort-multipart-upload/);
+  assert.match(common, /cleanupPending/);
+  assert.match(checkpoint, /versions_prefix="checkpoints\/historical\/versions\/"/);
+  assert.match(checkpoint, /key="\$\{versions_prefix\}builder-\$\{version\}\.sqlite"/);
+  assert.match(finalize, /snapshot_versions_prefix="snapshots\/historical\/versions\/"/);
+  assert.match(finalize, /key="\$\{snapshot_versions_prefix\}builder-\$\{version\}\.sqlite\.gz"/);
+  assert.match(finalize, /gzip -9n/);
+  assert.doesNotMatch(`${checkpoint}\n${finalize}`, /copy-object|s3 cp "s3:\/\/[^ ]+" "s3:\//);
+});
+
+test("watchdog measurement failure warns without cancelling a running Backfill", async () => {
+  const watchdog = await readFile(".github/workflows/r2-capacity-watchdog.yml", "utf8");
+  assert.match(watchdog, /Stop historical jobs only when measured usage is unsafe/);
+  assert.match(watchdog, /if: steps\.usage\.outputs\.over_limit == 'true'/);
+  assert.doesNotMatch(watchdog, /steps\.usage\.outcome == 'failure' \|\|/);
 });
 
 test("daily GitHub Action updates both markets through the server API", async () => {
