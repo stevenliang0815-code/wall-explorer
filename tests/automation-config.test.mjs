@@ -145,7 +145,7 @@ test("Backfill 38 recovery aborts only the matched upload before zero-byte verif
   const verify = recoverBody.indexOf("assert_zero_unfinished_and_no_orphan");
   const dispatch = recoverBody.indexOf("resume_last_slice");
   assert.match(workflow, /push:\n\s+branches: \[main\]/);
-  assert.doesNotMatch(workflow, /workflow_dispatch/);
+  assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /group: wall-explorer-historical-snapshot/);
   assert.match(recovery, /99\.69/);
   assert.match(recovery, /expected_parts=5/);
@@ -159,6 +159,10 @@ test("Backfill 38 recovery aborts only the matched upload before zero-byte verif
   assert.match(recovery, /while true; do/);
   assert.match(recovery, /max_verified_aborts/);
   assert.match(recovery, /aborted-upload-hashes/);
+  assert.match(recovery, /recoveryAbortCount/);
+  assert.match(recovery, /dispatch_next_recovery_batch/);
+  assert.match(recovery, /gh workflow run historical-backfill38-recovery\.yml/);
+  assert.match(recovery, /Recovery continuation requires the durable pause marker/);
   assert.match(recovery, /assert_paused_pointer[\s\S]*assert_lease_inactive[\s\S]*load_exact_stale_upload[\s\S]*abort_multipart_upload_exact/);
   assert.doesNotMatch(recovery, /abort_uploads_for_key/);
   assert.match(recovery, /multipartUploads.*multipartBytes/s);
