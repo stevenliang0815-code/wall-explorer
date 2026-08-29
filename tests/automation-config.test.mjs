@@ -171,6 +171,8 @@ test("dry-run measures pending promotion without simulating a forbidden third ra
   assert.match(workflow, /multipart_uploads/);
   assert.match(workflow, /r2-backfill38-recovery\.sh preflight/);
   assert.match(workflow, /exact read-only Backfill #38 recovery preflight/);
+  assert.match(workflow, /scripts\/r2-backfill38-recovery\.sh/);
+  assert.match(workflow, /tests\/automation-config\.test\.mjs/);
 });
 
 test("watchdog measurement failure warns without cancelling a running Backfill", async () => {
