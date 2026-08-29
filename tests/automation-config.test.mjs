@@ -121,6 +121,13 @@ test("R2 lifecycle uses CAS, explicit multipart abort, cleanup gate, and immutab
   assert.match(common, /--if-match/);
   assert.match(common, /--if-none-match/);
   assert.match(common, /abort-multipart-upload/);
+  assert.match(common, /R2_TRANSIENT_MAX_ATTEMPTS:-8/);
+  assert.match(common, /408\|429\|500\|502\|503\|504/);
+  assert.match(common, /connection \(reset\|closed\|aborted\)/);
+  assert.match(common, /write_multipart_state_file/);
+  assert.match(common, /"parts":\[/);
+  assert.match(common, /abort_multipart_upload_exact "\$key" "\$upload_id"/);
+  assert.match(common, /write_durable_stop/);
   assert.match(common, /cleanupPending/);
   assert.match(checkpoint, /versions_prefix="checkpoints\/historical\/versions\/"/);
   assert.match(checkpoint, /key="\$\{versions_prefix\}builder-\$\{version\}\.sqlite"/);
@@ -128,6 +135,28 @@ test("R2 lifecycle uses CAS, explicit multipart abort, cleanup gate, and immutab
   assert.match(finalize, /key="\$\{snapshot_versions_prefix\}builder-\$\{version\}\.sqlite\.gz"/);
   assert.match(finalize, /gzip -9n/);
   assert.doesNotMatch(`${checkpoint}\n${finalize}`, /copy-object|s3 cp "s3:\/\/[^ ]+" "s3:\//);
+});
+
+test("Backfill 38 recovery aborts only the matched upload before zero-byte verification and final-slice dispatch", async () => {
+  const workflow = await readFile(".github/workflows/historical-backfill38-recovery.yml", "utf8");
+  const recovery = await readFile("scripts/r2-backfill38-recovery.sh", "utf8");
+  const recoverBody = recovery.slice(recovery.indexOf("recover() {"));
+  const abort = recoverBody.indexOf("abort_multipart_upload_exact");
+  const verify = recoverBody.indexOf("assert_zero_unfinished_and_no_orphan");
+  const dispatch = recoverBody.indexOf("resume_last_slice");
+  assert.match(workflow, /push:\n\s+branches: \[main\]/);
+  assert.doesNotMatch(workflow, /workflow_dispatch/);
+  assert.match(workflow, /group: wall-explorer-historical-snapshot/);
+  assert.match(recovery, /99\.69/);
+  assert.match(recovery, /expected_parts=5/);
+  assert.match(recovery, /expected_part_bytes=1342177280/);
+  assert.match(recovery, /descriptor_id.*upload_id/);
+  assert.match(recovery, /multipartUploads.*multipartBytes/s);
+  assert.match(recovery, /state_transition BACKFILLING/);
+  assert.match(recovery, /projected_peak_guard/);
+  assert.ok(abort >= 0 && verify > abort && dispatch > verify, "exact abort and zero-byte verification must precede resume dispatch");
+  assert.doesNotMatch(recovery, /historical-checkpoint-promotion|historical-finalize/);
+  assert.doesNotMatch(recovery, /delete-object[^\n]*(builder|checkpoint)/);
 });
 
 test("dry-run measures pending promotion without simulating a forbidden third raw", async () => {

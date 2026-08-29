@@ -107,4 +107,11 @@ jobs:
         run: gh workflow run historical-checkpoint-promotion.yml --repo "$GITHUB_REPOSITORY" --ref main
       - name: Record failure without moving the canonical pointer
         if: failure()
-        run: bash scripts/r2-checkpoint-lifecycle.sh record-stop "Backfill/checkpoint upload failed in run ${GITHUB_RUN_ID}; the last verified canonical was retained."
+        run: |
+          set -euo pipefail
+          source scripts/r2-historical-common.sh
+          if object_exists "$stop_key"; then
+            echo "Preserved the uploader's durable stop after explicit abort handling."
+          else
+            bash scripts/r2-checkpoint-lifecycle.sh record-stop "Backfill/checkpoint upload failed in run ${GITHUB_RUN_ID}; the last verified canonical was retained."
+          fi

@@ -79,14 +79,19 @@ PY
 
 validate_sqlite() {
   local db="$1" status="$2" report="$3"
-  python3 - "$db" "$status" "$report" <<'PY'
+  python3 - "$db" "$status" "$report" "${SNAPSHOT_EXPECTED_LAST_DATE:-2025-12-28}" <<'PY'
 import datetime,hashlib,json,os,sqlite3,sys
-db,status_path,out=sys.argv[1:]
+db,status_path,out,expected_last=sys.argv[1:]
 for suffix in ("-wal","-journal"):
     if os.path.exists(db+suffix) and os.path.getsize(db+suffix): raise SystemExit(f"SQLite {suffix} is not empty")
 s=json.load(open(status_path)); progress=float(s.get("progress",-1))
 if not 0 <= progress <= 100: raise SystemExit("Progress outside 0..100")
 if not s.get("currentDate"): raise SystemExit("Missing last completed date")
+if progress == 100:
+    if s.get("status") != "complete": raise SystemExit("100% checkpoint status is not complete")
+    if s.get("currentDate") != expected_last: raise SystemExit("Unexpected final completed date")
+    if int(s.get("overallCompletedUnits",-1)) != int(s.get("totalUnits",-2)): raise SystemExit("100% checkpoint units are incomplete")
+    if int(s.get("failedUnits",0)) != 0: raise SystemExit("100% checkpoint contains failed units")
 con=sqlite3.connect(f"file:{db}?mode=ro",uri=True)
 try:
     integrity=con.execute("PRAGMA integrity_check").fetchone()[0]
@@ -99,8 +104,9 @@ with open(db,"rb") as f:
     for chunk in iter(lambda:f.read(8*1024*1024),b""): h.update(chunk)
 stored=int(s.get("storedRows",rows)); continuation=int(s.get("continuationRows",0))
 if rows+continuation != stored: raise SystemExit("Row count does not match durable status")
-d={"format":"wall-explorer-historical-checkpoint-manifest-v3","version":h.hexdigest(),"bytes":os.path.getsize(db),"sha256":h.hexdigest(),"rows":stored,"segmentRows":rows,"progress":progress,"lastDate":s["currentDate"],"schemaVersion":schema,"overallCompletedUnits":int(s.get("overallCompletedUnits",0)),"totalUnits":int(s.get("totalUnits",0)),"integrityCheck":"ok","wal":"clean","status":"uploaded","createdAt":datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z")}
+d={"format":"wall-explorer-historical-checkpoint-manifest-v3","version":h.hexdigest(),"bytes":os.path.getsize(db),"sha256":h.hexdigest(),"rows":stored,"segmentRows":rows,"progress":progress,"lastDate":s["currentDate"],"lastCompletedUnit":int(s.get("overallCompletedUnits",0)),"schemaVersion":schema,"overallCompletedUnits":int(s.get("overallCompletedUnits",0)),"totalUnits":int(s.get("totalUnits",0)),"failedUnits":int(s.get("failedUnits",0)),"integrityCheck":"ok","wal":"clean","status":"validated-before-upload","createdAt":datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z")}
 json.dump(d,open(out,"w"),separators=(",", ":")); open(out,"a").write("\n")
+print("CHECKPOINT_PREUPLOAD_VALIDATION="+json.dumps({k:d[k] for k in ("bytes","sha256","rows","progress","lastDate","lastCompletedUnit","totalUnits","failedUnits","schemaVersion","integrityCheck","wal")},separators=(",", ":")))
 PY
 }
 
@@ -353,15 +359,7 @@ PY
 }
 
 record_stop() {
-  local reason="${1:-Historical lifecycle stopped}" file etag
-  file=$(mktemp)
-  python3 - "$reason" "$file" <<'PY'
-import datetime,json,os,sys
-json.dump({"status":"paused","reason":sys.argv[1],"runId":os.getenv("GITHUB_RUN_ID","manual"),"recordedAt":datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z")},open(sys.argv[2],"w"),separators=(",", ":")); open(sys.argv[2],"a").write("\n")
-PY
-  if object_exists "$stop_key"; then etag=$(object_etag "$stop_key"); else etag=ABSENT; fi
-  put_json_cas "$file" "$stop_key" "$etag"
-  rm -f -- "$file"
+  write_durable_stop "${1:-Historical lifecycle stopped}"
 }
 
 case "$operation" in
