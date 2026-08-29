@@ -156,6 +156,11 @@ test("Backfill 38 recovery aborts only the matched upload before zero-byte verif
   assert.match(recovery, /expected_backfill_run_id=33217534006/);
   assert.match(recovery, /started <= initiated <= released/);
   assert.match(recovery, /supersededUploadIdSha256/);
+  assert.match(recovery, /while true; do/);
+  assert.match(recovery, /max_verified_aborts/);
+  assert.match(recovery, /aborted-upload-hashes/);
+  assert.match(recovery, /assert_paused_pointer[\s\S]*assert_lease_inactive[\s\S]*load_exact_stale_upload[\s\S]*abort_multipart_upload_exact/);
+  assert.doesNotMatch(recovery, /abort_uploads_for_key/);
   assert.match(recovery, /multipartUploads.*multipartBytes/s);
   assert.match(recovery, /state_transition BACKFILLING/);
   assert.match(recovery, /projected_peak_guard/);
