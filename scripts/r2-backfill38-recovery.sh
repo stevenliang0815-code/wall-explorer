@@ -129,7 +129,7 @@ mark_descriptor_aborted() {
 import datetime,hashlib,json,sys
 d=json.load(open(sys.argv[1])); previous=d.get("uploadId","")
 if previous != sys.argv[3]: d["supersededUploadIdSha256"]=hashlib.sha256(previous.encode()).hexdigest()
-d["uploadId"]=sys.argv[3]; d["status"]="aborted"; d["abortedAt"]=datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"); d["recovery"]="backfill-38-explicit-abort"; json.dump(d,open(sys.argv[2],"w"),separators=(",", ":")); open(sys.argv[2],"a").write("\n")
+d["uploadId"]=sys.argv[3]; d["status"]="aborted"; d["abortedAt"]=datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"); d["recovery"]="backfill-38-explicit-abort"; d["recoveryAbortCount"]=int(d.get("recoveryAbortCount",0))+1; json.dump(d,open(sys.argv[2],"w"),separators=(",", ":")); open(sys.argv[2],"a").write("\n")
 PY
   put_json_cas "$recovery_dir/aborted-descriptor.json" "$stale_descriptor_key" "$etag"
 }
@@ -195,6 +195,26 @@ resume_last_slice() {
   echo "Backfill #38 recovery dispatched only the final slice from the verified 99.69% checkpoint."
 }
 
+dispatch_next_recovery_batch() {
+  local attempt=1 delay
+  assert_paused_pointer
+  assert_lease_inactive
+  object_exists "$stop_key" || {
+    echo "::error::Recovery continuation requires the durable pause marker." >&2
+    return 43
+  }
+  while ! gh workflow run historical-backfill38-recovery.yml --repo "$GITHUB_REPOSITORY" --ref main; do
+    [ "$attempt" -lt 5 ] || {
+      echo "::error::Failed to dispatch the next verified recovery batch after ${attempt} attempts." >&2
+      return 47
+    }
+    delay=$((2 ** (attempt - 1) + RANDOM % 3))
+    sleep "$delay"
+    attempt=$((attempt + 1))
+  done
+  echo "Backfill #38 recovery batch reached ${max_verified_aborts} verified aborts; the next paused batch was dispatched."
+}
+
 recover() {
   local abort_count=0 load_code upload_id upload_hash
   recovery_dir=$(mktemp -d)
@@ -211,11 +231,11 @@ recover() {
       return "$load_code"
     fi
 
+    if [ "$abort_count" -ge "$max_verified_aborts" ]; then
+      dispatch_next_recovery_batch
+      return 0
+    fi
     abort_count=$((abort_count + 1))
-    [ "$abort_count" -le "$max_verified_aborts" ] || {
-      echo "::error::Backfill #38 recovery exceeded ${max_verified_aborts} individually verified aborts." >&2
-      return 47
-    }
     upload_id=$(cat "$recovery_dir/exact-upload-id")
     upload_hash=$(printf '%s' "$upload_id" | sha256sum | awk '{print $1}')
     ! grep -Fqx -- "$upload_hash" "$recovery_dir/aborted-upload-hashes" || {
