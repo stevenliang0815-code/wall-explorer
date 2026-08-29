@@ -154,6 +154,8 @@ test("Backfill 38 recovery aborts only the matched upload before zero-byte verif
   assert.match(recovery, /multipartUploads.*multipartBytes/s);
   assert.match(recovery, /state_transition BACKFILLING/);
   assert.match(recovery, /projected_peak_guard/);
+  assert.match(recovery, /preflight\(\)/);
+  assert.match(recovery, /projected_peak_guard "\$expected_new_checkpoint_bytes" "\$expected_part_bytes"/);
   assert.ok(abort >= 0 && verify > abort && dispatch > verify, "exact abort and zero-byte verification must precede resume dispatch");
   assert.doesNotMatch(recovery, /historical-checkpoint-promotion|historical-finalize/);
   assert.doesNotMatch(recovery, /delete-object[^\n]*(builder|checkpoint)/);
@@ -164,6 +166,9 @@ test("dry-run measures pending promotion without simulating a forbidden third ra
   assert.match(workflow, /pending-checkpoint\.json/);
   assert.match(workflow, /expected_bytes=0/);
   assert.match(workflow, /forbidden third raw/);
+  assert.match(workflow, /multipart_uploads/);
+  assert.match(workflow, /r2-backfill38-recovery\.sh preflight/);
+  assert.match(workflow, /exact read-only Backfill #38 recovery preflight/);
 });
 
 test("watchdog measurement failure warns without cancelling a running Backfill", async () => {
