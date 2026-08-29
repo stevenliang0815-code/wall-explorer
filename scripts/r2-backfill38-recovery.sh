@@ -7,11 +7,15 @@ stale_descriptor_key="jobs/historical/uploads/checkpoint-49d878fe74fed0981c6fb74
 expected_parts=5
 expected_part_bytes=1342177280
 expected_new_checkpoint_bytes=10164809728
+expected_backfill_run_id=33217534006
 
 # shellcheck source=scripts/r2-historical-common.sh
 source scripts/r2-historical-common.sh
 
 recovery_dir=""
+lease_owner=""
+lease_started_at=""
+lease_released_at=""
 cleanup() {
   [ -z "$recovery_dir" ] || rm -r -- "$recovery_dir"
 }
@@ -44,11 +48,11 @@ PY
 
 assert_lease_inactive() {
   local status expires now
-  object_exists "$lease_key" || return 0
+  object_exists "$lease_key" || { echo "::error::Backfill #38 durable lease record is missing." >&2; return 46; }
   download_object "$lease_key" "$recovery_dir/lease.json"
-  read -r status expires < <(python3 - "$recovery_dir/lease.json" <<'PY'
+  read -r status expires lease_owner lease_started_at lease_released_at < <(python3 - "$recovery_dir/lease.json" <<'PY'
 import json,sys
-d=json.load(open(sys.argv[1])); print(d.get("status","active"),int(d.get("expiresEpoch",0)))
+d=json.load(open(sys.argv[1])); print(d.get("status","active"),int(d.get("expiresEpoch",0)),d.get("owner","-"),d.get("startedAt","-"),d.get("releasedAt","-"))
 PY
 )
   now=$(date -u +%s)
@@ -56,10 +60,18 @@ PY
     echo "::error::An active lifecycle lease exists; refusing recovery." >&2
     return 45
   }
+  [[ "$lease_owner" =~ ^backfill-${expected_backfill_run_id}-[0-9]+$ ]] || {
+    echo "::error::Durable lease does not belong to Backfill #38: $lease_owner" >&2
+    return 46
+  }
+  [ "$status" = released ] && [ "$lease_started_at" != - ] && [ "$lease_released_at" != - ] || {
+    echo "::error::Backfill #38 lease is not durably released with a complete time window." >&2
+    return 46
+  }
 }
 
 load_exact_stale_upload() {
-  local uploads="$recovery_dir/uploads.json" count key upload_id parts descriptor_id descriptor_key descriptor_parts descriptor_bytes
+  local uploads="$recovery_dir/uploads.json" count key upload_id upload_initiated parts descriptor_id descriptor_key descriptor_parts descriptor_bytes
   list_multipart_uploads_to_file "$uploads"
   count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("Uploads",[])))' "$uploads")
   if [ "$count" -eq 0 ]; then
@@ -68,7 +80,18 @@ load_exact_stale_upload() {
   [ "$count" -eq 1 ] || { echo "::error::Expected one Backfill #38 multipart upload, found $count." >&2; return 45; }
   key=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["Uploads"][0]["Key"])' "$uploads")
   upload_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["Uploads"][0]["UploadId"])' "$uploads")
+  upload_initiated=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["Uploads"][0]["Initiated"])' "$uploads")
   [ "$key" = "$stale_object_key" ] || { echo "::error::The sole multipart upload is not Backfill #38." >&2; return 45; }
+  if ! python3 - "$upload_initiated" "$lease_started_at" "$lease_released_at" <<'PY'
+import datetime,sys
+def parse(value): return datetime.datetime.fromisoformat(value.replace("Z","+00:00"))
+initiated,started,released=map(parse,sys.argv[1:])
+raise SystemExit(0 if started <= initiated <= released else 1)
+PY
+  then
+    echo "::error::Multipart creation time falls outside Backfill #38's durable lease window." >&2
+    return 46
+  fi
   object_exists "$stale_descriptor_key" || { echo "::error::Backfill #38 durable upload record is missing." >&2; return 46; }
   download_object "$stale_descriptor_key" "$recovery_dir/stale-descriptor.json"
   descriptor_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["uploadId"])' "$recovery_dir/stale-descriptor.json")
@@ -83,8 +106,7 @@ load_exact_stale_upload() {
     local descriptor_id_hash upload_id_hash
     descriptor_id_hash=$(printf '%s' "$descriptor_id" | sha256sum | awk '{print substr($1,1,16)}')
     upload_id_hash=$(printf '%s' "$upload_id" | sha256sum | awk '{print substr($1,1,16)}')
-    echo "::error::Backfill #38 UploadId mismatch: durable=${descriptor_id_hash}/len${#descriptor_id}, current=${upload_id_hash}/len${#upload_id}." >&2
-    return 46
+    echo "::warning::Legacy descriptor UploadId is stale: durable=${descriptor_id_hash}/len${#descriptor_id}, current=${upload_id_hash}/len${#upload_id}; the sole current upload is bound to Backfill #38 by key, parts, bytes, and durable lease time window." >&2
   fi
   parts="$recovery_dir/stale-parts.json"
   r2_retry_to_files "$parts" "$recovery_dir/stale-parts.err" s3api list-parts --bucket "$bucket" --key "$key" --upload-id "$upload_id" --output json
@@ -99,11 +121,14 @@ PY
 }
 
 mark_descriptor_aborted() {
-  local etag
+  local etag actual_upload_id
   etag=$(object_etag "$stale_descriptor_key")
-  python3 - "$recovery_dir/stale-descriptor.json" "$recovery_dir/aborted-descriptor.json" <<'PY'
-import datetime,json,sys
-d=json.load(open(sys.argv[1])); d["status"]="aborted"; d["abortedAt"]=datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"); d["recovery"]="backfill-38-explicit-abort"; json.dump(d,open(sys.argv[2],"w"),separators=(",", ":")); open(sys.argv[2],"a").write("\n")
+  actual_upload_id=$(cat "$recovery_dir/exact-upload-id")
+  python3 - "$recovery_dir/stale-descriptor.json" "$recovery_dir/aborted-descriptor.json" "$actual_upload_id" <<'PY'
+import datetime,hashlib,json,sys
+d=json.load(open(sys.argv[1])); previous=d.get("uploadId","")
+if previous != sys.argv[3]: d["supersededUploadIdSha256"]=hashlib.sha256(previous.encode()).hexdigest()
+d["uploadId"]=sys.argv[3]; d["status"]="aborted"; d["abortedAt"]=datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z"); d["recovery"]="backfill-38-explicit-abort"; json.dump(d,open(sys.argv[2],"w"),separators=(",", ":")); open(sys.argv[2],"a").write("\n")
 PY
   put_json_cas "$recovery_dir/aborted-descriptor.json" "$stale_descriptor_key" "$etag"
 }
