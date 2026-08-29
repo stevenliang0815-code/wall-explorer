@@ -9,7 +9,9 @@ name: Historical Lifecycle Dry Run
       - "scripts/historical-lifecycle.mjs"
       - "scripts/r2-*-lifecycle.sh"
       - "scripts/r2-historical-*.sh"
+      - "scripts/r2-backfill38-recovery.sh"
       - "tests/historical-lifecycle.test.mjs"
+      - "tests/automation-config.test.mjs"
   push:
     paths:
       - ".github/workflows/historical-*.yml"
@@ -17,7 +19,9 @@ name: Historical Lifecycle Dry Run
       - "scripts/historical-lifecycle.mjs"
       - "scripts/r2-*-lifecycle.sh"
       - "scripts/r2-historical-*.sh"
+      - "scripts/r2-backfill38-recovery.sh"
       - "tests/historical-lifecycle.test.mjs"
+      - "tests/automation-config.test.mjs"
 
 permissions:
   contents: read
@@ -43,8 +47,9 @@ jobs:
       - name: Static architecture and failure tests
         run: |
           set -euo pipefail
-          bash -n scripts/r2-historical-common.sh scripts/r2-checkpoint-lifecycle.sh scripts/r2-finalize-lifecycle.sh scripts/r2-historical-gc.sh
+          bash -n scripts/r2-historical-common.sh scripts/r2-checkpoint-lifecycle.sh scripts/r2-finalize-lifecycle.sh scripts/r2-historical-gc.sh scripts/r2-backfill38-recovery.sh
           node --test tests/historical-lifecycle.test.mjs
+          node --test --test-name-pattern='R2 lifecycle uses|Backfill 38 recovery|dry-run measures' tests/automation-config.test.mjs
           ! grep -R -E 'copy-object|s3 cp "s3://[^ ]+" "s3://' scripts/r2-*-lifecycle.sh scripts/r2-historical-common.sh
           grep -F -- '--if-match' scripts/r2-historical-common.sh
           grep -F -- '--if-none-match' scripts/r2-historical-common.sh
