@@ -75,7 +75,17 @@ load_exact_stale_upload() {
   descriptor_key=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["objectKey"])' "$recovery_dir/stale-descriptor.json")
   descriptor_parts=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["completedParts"]))' "$recovery_dir/stale-descriptor.json")
   descriptor_bytes=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["completedBytes"]))' "$recovery_dir/stale-descriptor.json")
-  [ "$descriptor_id" = "$upload_id" ] && [ "$descriptor_key" = "$key" ] || { echo "::error::Multipart upload does not match its durable Backfill #38 record." >&2; return 46; }
+  if [ "$descriptor_key" != "$key" ]; then
+    echo "::error::Backfill #38 descriptor object key does not match the sole unfinished multipart key." >&2
+    return 46
+  fi
+  if [ "$descriptor_id" != "$upload_id" ]; then
+    local descriptor_id_hash upload_id_hash
+    descriptor_id_hash=$(printf '%s' "$descriptor_id" | sha256sum | awk '{print substr($1,1,16)}')
+    upload_id_hash=$(printf '%s' "$upload_id" | sha256sum | awk '{print substr($1,1,16)}')
+    echo "::error::Backfill #38 UploadId mismatch: durable=${descriptor_id_hash}/len${#descriptor_id}, current=${upload_id_hash}/len${#upload_id}." >&2
+    return 46
+  fi
   parts="$recovery_dir/stale-parts.json"
   r2_retry_to_files "$parts" "$recovery_dir/stale-parts.err" s3api list-parts --bucket "$bucket" --key "$key" --upload-id "$upload_id" --output json
   read -r listed_parts listed_bytes < <(python3 - "$parts" <<'PY'
