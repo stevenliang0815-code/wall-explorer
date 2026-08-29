@@ -6,6 +6,7 @@ name: Recover Backfill 38 Multipart Failure
     paths:
       - .github/workflows/historical-backfill38-recovery.yml
       - scripts/r2-backfill38-recovery.sh
+  workflow_dispatch:
 
 permissions:
   actions: write
@@ -42,5 +43,5 @@ jobs:
           bash -n scripts/r2-historical-common.sh scripts/r2-checkpoint-lifecycle.sh scripts/r2-backfill38-recovery.sh
           node --test tests/historical-lifecycle.test.mjs tests/r2-multipart-retry.test.mjs
           node --test --test-name-pattern='R2 lifecycle uses|Backfill 38 recovery' tests/automation-config.test.mjs
-      - name: Abort only Backfill 38, verify zero unfinished bytes, and resume the final slice
+      - name: Abort only verified Backfill 38 uploads, chain paused batches, and resume the final slice after zero
         run: bash scripts/r2-backfill38-recovery.sh recover
