@@ -8,6 +8,7 @@ expected_parts=5
 expected_part_bytes=1342177280
 expected_new_checkpoint_bytes=10164809728
 expected_backfill_run_id=33217534006
+max_verified_aborts="${BACKFILL38_MAX_VERIFIED_ABORTS:-128}"
 
 # shellcheck source=scripts/r2-historical-common.sh
 source scripts/r2-historical-common.sh
@@ -195,14 +196,42 @@ resume_last_slice() {
 }
 
 recover() {
+  local abort_count=0 load_code upload_id upload_hash
   recovery_dir=$(mktemp -d)
+  : > "$recovery_dir/aborted-upload-hashes"
   assert_paused_pointer
   assert_lease_inactive
-  if load_exact_stale_upload; then
-    abort_multipart_upload_exact "$stale_object_key" "$(cat "$recovery_dir/exact-upload-id")"
+
+  while true; do
+    if load_exact_stale_upload; then
+      :
+    else
+      load_code=$?
+      [ "$load_code" -eq 1 ] && break
+      return "$load_code"
+    fi
+
+    abort_count=$((abort_count + 1))
+    [ "$abort_count" -le "$max_verified_aborts" ] || {
+      echo "::error::Backfill #38 recovery exceeded ${max_verified_aborts} individually verified aborts." >&2
+      return 47
+    }
+    upload_id=$(cat "$recovery_dir/exact-upload-id")
+    upload_hash=$(printf '%s' "$upload_id" | sha256sum | awk '{print $1}')
+    ! grep -Fqx -- "$upload_hash" "$recovery_dir/aborted-upload-hashes" || {
+      echo "::error::R2 returned a previously aborted multipart UploadId." >&2
+      return 47
+    }
+    printf '%s\n' "$upload_hash" >> "$recovery_dir/aborted-upload-hashes"
+
+    abort_multipart_upload_exact "$stale_object_key" "$upload_id"
     mark_descriptor_aborted
-  fi
+    assert_paused_pointer
+    assert_lease_inactive
+  done
+
   assert_zero_unfinished_and_no_orphan
+  echo "Backfill #38 individually verified multipart aborts completed: ${abort_count}."
   reset_upload_state_while_paused
   assert_paused_pointer
   resume_last_slice
