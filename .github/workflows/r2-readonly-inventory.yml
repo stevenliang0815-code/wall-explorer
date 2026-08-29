@@ -68,9 +68,9 @@ jobs:
           while IFS= read -r -d '' object_key && IFS= read -r -d '' upload_id; do
             parts_file="/tmp/r2-parts-${index}.json"
             aws --endpoint-url "$endpoint" s3api list-parts               --bucket "$R2_BUCKET"               --key "$object_key"               --upload-id "$upload_id"               --output json > "$parts_file"
-            python3 - "$object_key" "$parts_file" >> /tmp/r2-multipart-summary.ndjson <<'PY'
+            python3 - "$object_key" "$upload_id" "$parts_file" >> /tmp/r2-multipart-summary.ndjson <<'PY'
           import json, sys
-          key, path = sys.argv[1:]
+          key, upload_id, path = sys.argv[1:]
           data = json.load(open(path, encoding="utf-8"))
           parts = data.get("Parts", [])
           print(json.dumps({
