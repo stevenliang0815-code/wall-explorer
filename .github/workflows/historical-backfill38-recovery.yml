@@ -3,7 +3,9 @@ name: Recover Backfill 38 Multipart Failure
 "on":
   push:
     branches: [main]
-    paths: [.github/workflows/historical-backfill38-recovery.yml]
+    paths:
+      - .github/workflows/historical-backfill38-recovery.yml
+      - scripts/r2-backfill38-recovery.sh
 
 permissions:
   actions: write
@@ -26,6 +28,7 @@ jobs:
       R2_STORAGE_LIMIT_BYTES: "25000000000"
       R2_SAFETY_RESERVE_BYTES: "100000000"
       R2_TRANSIENT_MAX_ATTEMPTS: "8"
+      BACKFILL38_MAX_VERIFIED_ABORTS: "128"
       GH_TOKEN: ${{ github.token }}
 
     steps:
