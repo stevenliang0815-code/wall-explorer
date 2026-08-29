@@ -173,7 +173,35 @@ recover() {
   resume_last_slice
 }
 
+preflight() {
+  local usage uploads bytes
+  recovery_dir=$(mktemp -d)
+  assert_paused_pointer
+  assert_lease_inactive
+  usage=$(r2_usage_json)
+  read -r uploads bytes < <(python3 - "$usage" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1]); print(d["multipartUploads"],d["multipartBytes"])
+PY
+)
+  [ "$uploads" -eq 1 ] && [ "$bytes" -eq "$expected_part_bytes" ] || {
+    echo "::error::Backfill #38 recovery preflight expected exactly one unfinished multipart with ${expected_part_bytes} bytes; found ${uploads} upload(s) and ${bytes} bytes." >&2
+    return 45
+  }
+  load_exact_stale_upload || {
+    echo "::error::The unfinished multipart does not exactly match Backfill #38's durable recovery record." >&2
+    return 45
+  }
+  object_exists "$stale_object_key" && {
+    echo "::error::A completed object already exists at the Backfill #38 recovery target." >&2
+    return 47
+  }
+  projected_peak_guard "$expected_new_checkpoint_bytes" "$expected_part_bytes"
+  echo "Read-only recovery preflight passed: exact Backfill #38 upload matched; no pointer, object, state, lease, or multipart was mutated."
+}
+
 case "${1:-recover}" in
   recover) recover ;;
-  *) echo "Usage: $0 recover" >&2; exit 2 ;;
+  preflight) preflight ;;
+  *) echo "Usage: $0 {recover|preflight}" >&2; exit 2 ;;
 esac
