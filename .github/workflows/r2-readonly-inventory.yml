@@ -75,6 +75,7 @@ jobs:
           parts = data.get("Parts", [])
           print(json.dumps({
               "key": key,
+              "uploadId": upload_id,
               "partCount": len(parts),
               "bytes": sum(int(part.get("Size", 0)) for part in parts),
           }, ensure_ascii=False))
