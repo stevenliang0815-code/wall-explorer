@@ -7,6 +7,8 @@ name: Recover Backfill 38 Multipart Failure
       - .github/workflows/historical-backfill38-recovery.yml
       - scripts/r2-backfill38-recovery.sh
   workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
 
 permissions:
   actions: write
@@ -30,6 +32,8 @@ jobs:
       R2_SAFETY_RESERVE_BYTES: "100000000"
       R2_TRANSIENT_MAX_ATTEMPTS: "8"
       BACKFILL38_MAX_VERIFIED_ABORTS: "128"
+      BACKFILL38_GH_DISPATCH_MAX_ATTEMPTS: "12"
+      BACKFILL38_GH_DISPATCH_MAX_DELAY_SECONDS: "60"
       GH_TOKEN: ${{ github.token }}
 
     steps:
@@ -44,4 +48,9 @@ jobs:
           node --test tests/historical-lifecycle.test.mjs tests/r2-multipart-retry.test.mjs
           node --test --test-name-pattern='R2 lifecycle uses|Backfill 38 recovery' tests/automation-config.test.mjs
       - name: Abort only verified Backfill 38 uploads, chain paused batches, and resume the final slice after zero
-        run: bash scripts/r2-backfill38-recovery.sh recover
+        run: |
+          if [ "${{ github.event_name }}" = schedule ]; then
+            bash scripts/r2-backfill38-recovery.sh recover-scheduled
+          else
+            bash scripts/r2-backfill38-recovery.sh recover
+          fi

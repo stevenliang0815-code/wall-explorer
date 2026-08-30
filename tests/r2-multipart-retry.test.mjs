@@ -120,3 +120,68 @@ test("transient classifier covers required HTTP statuses and connection failures
   `], { env: { ...env, TMPDIR: os.tmpdir() } });
   assert.equal(stdout.trim().split("\n").length, 8);
 });
+
+test("Backfill recovery dispatch classifies GitHub network failures as transient", async () => {
+  const { stdout } = await execFile("bash", ["-c", String.raw`
+    set -euo pipefail
+    source scripts/r2-backfill38-recovery.sh
+    for message in 'i/o timeout' 'connection reset by peer' 'HTTP 429' 'HTTP 502' 'HTTP 503' 'HTTP 504' 'TLS handshake timeout'; do
+      printf '%s\n' "$message" > "$TMPDIR/github-error"
+      github_dispatch_error_is_transient "$TMPDIR/github-error"
+      printf 'ok\n'
+    done
+    printf '%s\n' 'HTTP 403 Resource not accessible by integration' > "$TMPDIR/github-error"
+    if github_dispatch_error_is_transient "$TMPDIR/github-error"; then exit 9; fi
+  `], { env: { ...env, TMPDIR: os.tmpdir() } });
+  assert.equal(stdout.trim().split("\n").length, 7);
+});
+
+test("Backfill recovery keeps the durable pause and defers after transient dispatch exhaustion", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "github-dispatch-"));
+  try {
+    const { stdout, stderr } = await execFile("bash", ["-c", String.raw`
+      set -euo pipefail
+      source scripts/r2-backfill38-recovery.sh
+      mkdir -p "$RECOVERY_DIR"
+      recovery_dir="$RECOVERY_DIR"
+      github_dispatch_max_attempts=3
+      github_dispatch_max_delay_seconds=0
+      attempts=0
+      assert_paused_pointer() { :; }
+      assert_lease_inactive() { :; }
+      object_exists() { :; }
+      sleep() { :; }
+      gh() { attempts=$((attempts + 1)); echo 'dial tcp: i/o timeout' >&2; return 1; }
+      dispatch_next_recovery_batch
+      printf 'attempts=%s\n' "$attempts"
+    `], { env: { ...env, RECOVERY_DIR: path.join(dir, "work"), GITHUB_REPOSITORY: "owner/repo", GITHUB_STEP_SUMMARY: path.join(dir, "summary") } });
+    assert.match(stdout, /attempts=3/);
+    assert.match(stderr, /hourly scheduled resumer will retry automatically/);
+    assert.match(await readFile(path.join(dir, "summary"), "utf8"), /durable pause and 99\.69% pointer remain intact/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Backfill recovery hard-stops on a non-transient GitHub dispatch error", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "github-dispatch-hard-"));
+  try {
+    await assert.rejects(execFile("bash", ["-c", String.raw`
+      set -euo pipefail
+      source scripts/r2-backfill38-recovery.sh
+      mkdir -p "$RECOVERY_DIR"
+      recovery_dir="$RECOVERY_DIR"
+      assert_paused_pointer() { :; }
+      assert_lease_inactive() { :; }
+      object_exists() { :; }
+      gh() { echo 'HTTP 403 Resource not accessible by integration' >&2; return 1; }
+      dispatch_next_recovery_batch
+    `], { env: { ...env, RECOVERY_DIR: path.join(dir, "work"), GITHUB_REPOSITORY: "owner/repo" } }), (error) => {
+      assert.equal(error.code, 47);
+      assert.match(error.stderr, /non-transient error/);
+      return true;
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
