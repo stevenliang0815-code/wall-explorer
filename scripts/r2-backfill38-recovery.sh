@@ -9,6 +9,8 @@ expected_part_bytes=1342177280
 expected_new_checkpoint_bytes=10164809728
 expected_backfill_run_id=33217534006
 max_verified_aborts="${BACKFILL38_MAX_VERIFIED_ABORTS:-128}"
+github_dispatch_max_attempts="${BACKFILL38_GH_DISPATCH_MAX_ATTEMPTS:-12}"
+github_dispatch_max_delay_seconds="${BACKFILL38_GH_DISPATCH_MAX_DELAY_SECONDS:-60}"
 
 # shellcheck source=scripts/r2-historical-common.sh
 source scripts/r2-historical-common.sh
@@ -195,24 +197,50 @@ resume_last_slice() {
   echo "Backfill #38 recovery dispatched only the final slice from the verified 99.69% checkpoint."
 }
 
+github_dispatch_error_is_transient() {
+  local error_file="$1"
+  grep -Eiq 'timed? out|i/o timeout|connection (reset|closed|aborted|refused)|temporary failure|TLS handshake timeout|EOF|HTTP (408|429|500|502|503|504)|status code: (408|429|500|502|503|504)|api rate limit|secondary rate limit|server error' "$error_file"
+}
+
 dispatch_next_recovery_batch() {
-  local attempt=1 delay
+  local attempt=1 delay error_file
   assert_paused_pointer
   assert_lease_inactive
   object_exists "$stop_key" || {
     echo "::error::Recovery continuation requires the durable pause marker." >&2
     return 43
   }
-  while ! gh workflow run historical-backfill38-recovery.yml --repo "$GITHUB_REPOSITORY" --ref main; do
-    [ "$attempt" -lt 5 ] || {
-      echo "::error::Failed to dispatch the next verified recovery batch after ${attempt} attempts." >&2
+  error_file="$recovery_dir/github-dispatch.err"
+  while ! gh workflow run historical-backfill38-recovery.yml --repo "$GITHUB_REPOSITORY" --ref main 2>"$error_file"; do
+    if ! github_dispatch_error_is_transient "$error_file"; then
+      sed 's/^/GitHub dispatch: /' "$error_file" >&2
+      echo "::error::The next recovery batch could not be dispatched because GitHub returned a non-transient error." >&2
       return 47
-    }
-    delay=$((2 ** (attempt - 1) + RANDOM % 3))
+    fi
+    if [ "$attempt" -ge "$github_dispatch_max_attempts" ]; then
+      assert_paused_pointer
+      assert_lease_inactive
+      object_exists "$stop_key" || return 43
+      echo "::warning::GitHub remained temporarily unreachable after ${attempt} dispatch attempts. Recovery is safely paused and the hourly scheduled resumer will retry automatically." >&2
+      printf '%s\n' "- Recovery dispatch deferred after ${attempt} transient GitHub API failures; the durable pause and 99.69% pointer remain intact." >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+      return 0
+    fi
+    delay=$((2 ** (attempt - 1)))
+    [ "$delay" -le "$github_dispatch_max_delay_seconds" ] || delay="$github_dispatch_max_delay_seconds"
+    delay=$((delay + RANDOM % 4))
+    echo "::warning::Transient GitHub dispatch failure on attempt ${attempt}; retrying after ${delay}s." >&2
     sleep "$delay"
     attempt=$((attempt + 1))
   done
   echo "Backfill #38 recovery batch reached ${max_verified_aborts} verified aborts; the next paused batch was dispatched."
+}
+
+recover_scheduled() {
+  if ! object_exists "$stop_key"; then
+    echo "Scheduled Backfill #38 recovery no-op: durable pause marker is absent."
+    return 0
+  fi
+  recover
 }
 
 recover() {
@@ -284,8 +312,15 @@ PY
   echo "Read-only recovery preflight passed: exact Backfill #38 upload matched; no pointer, object, state, lease, or multipart was mutated."
 }
 
-case "${1:-recover}" in
-  recover) recover ;;
-  preflight) preflight ;;
-  *) echo "Usage: $0 {recover|preflight}" >&2; exit 2 ;;
-esac
+main() {
+  case "${1:-recover}" in
+    recover) recover ;;
+    recover-scheduled) recover_scheduled ;;
+    preflight) preflight ;;
+    *) echo "Usage: $0 {recover|recover-scheduled|preflight}" >&2; exit 2 ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
