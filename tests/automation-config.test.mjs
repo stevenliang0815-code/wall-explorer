@@ -137,48 +137,23 @@ test("R2 lifecycle uses CAS, explicit multipart abort, cleanup gate, and immutab
   assert.doesNotMatch(`${checkpoint}\n${finalize}`, /copy-object|s3 cp "s3:\/\/[^ ]+" "s3:\//);
 });
 
-test("Backfill 38 recovery aborts only the matched upload before zero-byte verification and final-slice dispatch", async () => {
+test("Backfill 38 recovery chain is decommissioned and private classification is independent", async () => {
   const workflow = await readFile(".github/workflows/historical-backfill38-recovery.yml", "utf8");
-  const recovery = await readFile("scripts/r2-backfill38-recovery.sh", "utf8");
-  const recoverBody = recovery.slice(recovery.indexOf("recover() {"));
-  const abort = recoverBody.indexOf("abort_multipart_upload_exact");
-  const verify = recoverBody.indexOf("assert_zero_unfinished_and_no_orphan");
-  const dispatch = recoverBody.indexOf("resume_last_slice");
-  assert.match(workflow, /push:\n\s+branches: \[main\]/);
+  const classification = await readFile(".github/workflows/historical-multipart-classification.yml", "utf8");
+  const scanner = await readFile("scripts/r2-legacy-multipart-gc.sh", "utf8");
   assert.match(workflow, /workflow_dispatch:/);
-  assert.match(workflow, /schedule:\n\s+- cron: "17 \* \* \* \*"/);
-  assert.match(workflow, /group: wall-explorer-historical-snapshot/);
-  assert.match(recovery, /99\.69/);
-  assert.match(recovery, /expected_parts=5/);
-  assert.match(recovery, /expected_part_bytes=1342177280/);
-  assert.match(recovery, /descriptor_id.*upload_id/);
-  assert.match(recovery, /Legacy descriptor UploadId is stale: durable=/);
-  assert.match(recovery, /sha256sum/);
-  assert.match(recovery, /expected_backfill_run_id=33217534006/);
-  assert.match(recovery, /started <= initiated <= released/);
-  assert.match(recovery, /supersededUploadIdSha256/);
-  assert.match(recovery, /while true; do/);
-  assert.match(recovery, /max_verified_aborts/);
-  assert.match(recovery, /aborted-upload-hashes/);
-  assert.match(recovery, /recoveryAbortCount/);
-  assert.match(recovery, /dispatch_next_recovery_batch/);
-  assert.match(recovery, /gh workflow run historical-backfill38-recovery\.yml/);
-  assert.match(recovery, /github_dispatch_error_is_transient/);
-  assert.match(recovery, /BACKFILL38_GH_DISPATCH_MAX_ATTEMPTS:-12/);
-  assert.match(recovery, /hourly scheduled resumer will retry automatically/);
-  assert.match(recovery, /recover-scheduled/);
-  assert.match(workflow, /github\.event_name.*schedule/);
-  assert.match(recovery, /Recovery continuation requires the durable pause marker/);
-  assert.match(recovery, /assert_paused_pointer[\s\S]*assert_lease_inactive[\s\S]*load_exact_stale_upload[\s\S]*abort_multipart_upload_exact/);
-  assert.doesNotMatch(recovery, /abort_uploads_for_key/);
-  assert.match(recovery, /multipartUploads.*multipartBytes/s);
-  assert.match(recovery, /state_transition BACKFILLING/);
-  assert.match(recovery, /projected_peak_guard/);
-  assert.match(recovery, /preflight\(\)/);
-  assert.match(recovery, /projected_peak_guard "\$expected_new_checkpoint_bytes" "\$expected_part_bytes"/);
-  assert.ok(abort >= 0 && verify > abort && dispatch > verify, "exact abort and zero-byte verification must precede resume dispatch");
-  assert.doesNotMatch(recovery, /historical-checkpoint-promotion|historical-finalize/);
-  assert.doesNotMatch(recovery, /delete-object[^\n]*(builder|checkpoint)/);
+  assert.match(workflow, /permissions:\n\s+contents: read/);
+  assert.doesNotMatch(workflow, /schedule:|actions: write|abort-multipart-upload|gh workflow run/);
+  assert.match(classification, /Full paginated private classification/);
+  assert.doesNotMatch(classification, /actions\/upload-artifact|fingerprints\.ndjson/);
+  assert.doesNotMatch(classification, /abort-multipart-upload|delete-object|gh workflow run|current lifecycle unfinished|legacy currently listed/i);
+  assert.match(scanner, /--key-marker/);
+  assert.match(scanner, /--upload-id-marker/);
+  assert.match(scanner, /declare -A seen_uploads/);
+  assert.match(scanner, /IsTruncated=false/);
+  assert.match(scanner, /classification_key="jobs\/historical\/legacy-multipart-gc\/classification\.json"/);
+  assert.match(scanner, /put_json_cas "\$report_file" "\$classification_key"/);
+  assert.doesNotMatch(scanner, /abort-multipart-upload|delete-object|gh workflow run/);
 });
 
 test("dry-run measures pending promotion without simulating a forbidden third raw", async () => {
@@ -187,9 +162,7 @@ test("dry-run measures pending promotion without simulating a forbidden third ra
   assert.match(workflow, /expected_bytes=0/);
   assert.match(workflow, /forbidden third raw/);
   assert.match(workflow, /multipart_uploads/);
-  assert.match(workflow, /r2-backfill38-recovery\.sh preflight/);
-  assert.match(workflow, /exact read-only Backfill #38 recovery preflight/);
-  assert.match(workflow, /scripts\/r2-backfill38-recovery\.sh/);
+  assert.match(workflow, /r2-checkpoint-lifecycle\.sh projected-peak/);
   assert.match(workflow, /tests\/automation-config\.test\.mjs/);
 });
 
