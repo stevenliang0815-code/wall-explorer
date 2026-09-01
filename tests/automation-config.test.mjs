@@ -137,20 +137,22 @@ test("R2 lifecycle uses CAS, explicit multipart abort, cleanup gate, and immutab
   assert.doesNotMatch(`${checkpoint}\n${finalize}`, /copy-object|s3 cp "s3:\/\/[^ ]+" "s3:\//);
 });
 
-test("Backfill 38 recovery chain is decommissioned and read-only classification is independent", async () => {
+test("Backfill 38 recovery chain is decommissioned and private classification is independent", async () => {
   const workflow = await readFile(".github/workflows/historical-backfill38-recovery.yml", "utf8");
   const classification = await readFile(".github/workflows/historical-multipart-classification.yml", "utf8");
   const scanner = await readFile("scripts/r2-legacy-multipart-gc.sh", "utf8");
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /permissions:\n\s+contents: read/);
   assert.doesNotMatch(workflow, /schedule:|actions: write|abort-multipart-upload|gh workflow run/);
-  assert.match(classification, /Full paginated read-only classification/);
+  assert.match(classification, /Full paginated private classification/);
   assert.doesNotMatch(classification, /actions\/upload-artifact|fingerprints\.ndjson/);
-  assert.doesNotMatch(classification, /abort-multipart-upload|delete-object|gh workflow run/);
+  assert.doesNotMatch(classification, /abort-multipart-upload|delete-object|gh workflow run|current lifecycle unfinished|legacy currently listed/i);
   assert.match(scanner, /--key-marker/);
   assert.match(scanner, /--upload-id-marker/);
   assert.match(scanner, /declare -A seen_uploads/);
   assert.match(scanner, /IsTruncated=false/);
+  assert.match(scanner, /classification_key="jobs\/historical\/legacy-multipart-gc\/classification\.json"/);
+  assert.match(scanner, /put_json_cas "\$report_file" "\$classification_key"/);
   assert.doesNotMatch(scanner, /abort-multipart-upload|delete-object|gh workflow run/);
 });
 
