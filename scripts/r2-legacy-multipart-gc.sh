@@ -8,6 +8,7 @@ set -euo pipefail
 source scripts/r2-historical-common.sh
 
 historical_checkpoint_prefix="${R2_HISTORICAL_CHECKPOINT_PREFIX:-checkpoints/historical/versions/}"
+classification_key="jobs/historical/legacy-multipart-gc/classification.json"
 page_size="${R2_MULTIPART_PAGE_SIZE:-1000}"
 max_pages="${R2_MULTIPART_MAX_PAGES:-100000}"
 
@@ -240,19 +241,10 @@ path,current_bytes=sys.argv[1:]
 d=json.load(open(path)); d["currentLifecycle"]["unfinishedBytes"]=int(current_bytes)
 json.dump(d,open(path,"w"),separators=(",", ":")); open(path,"a").write("\n")
 PY
-  python3 - "$report_file" <<'PY'
-import json,sys
-d=json.load(open(sys.argv[1]))
-print("## Historical multipart classification")
-print()
-print(f"- Pagination complete: **{str(d['pagination']['complete']).lower()}** ({d['pagination']['pages']} page(s))")
-print(f"- Deduplicated uploads currently listed: **{d['pagination']['deduplicatedUploads']:,}**")
-print(f"- Current lifecycle unfinished: **{d['currentLifecycle']['unfinishedUploads']:,} upload(s), {d['currentLifecycle']['unfinishedBytes']:,} bytes**")
-print(f"- Legacy currently listed: **{d['legacy']['currentlyListedUploads']:,}**")
-print(f"- Legacy uploads already explicitly aborted: **{d['legacy']['verifiedPriorAborts']:,}**")
-print(f"- Known legacy total: **{d['legacy']['knownUploads']:,}**")
-print(f"- Keep-list uploads: **{d['keep']['uploads']:,}**")
-PY
+  local report_etag
+  if object_exists "$classification_key"; then report_etag=$(object_etag "$classification_key"); else report_etag=ABSENT; fi
+  put_json_cas "$report_file" "$classification_key" "$report_etag"
+  echo "Historical multipart classification completed and was stored privately."
   [ "$current_count" -ge 0 ]
   rm -r -- "$dir"
 }
@@ -268,4 +260,3 @@ main() {
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   main "$@"
 fi
-
