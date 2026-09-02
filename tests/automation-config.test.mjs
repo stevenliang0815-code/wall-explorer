@@ -73,6 +73,9 @@ test("Promotion, Finalize, and GC have separate large-object responsibilities", 
   assert.match(promotion, /pending-checkpoint\.json/);
   assert.match(promotion, /steps\.pause\.outputs\.pending == 'true'/);
   assert.match(promotion, /paths: \[\.github\/workflows\/historical-checkpoint-promotion\.yml\]/);
+  assert.match(promotion, /RAW_100_PERCENT/);
+  assert.match(promotion, /gh workflow run historical-finalize\.yml/);
+  assert.match(promotion, /steps\.pause\.outputs\.pending \}\}" = true/);
   assert.doesNotMatch(promotion, /build-historical-snapshot|r2-finalize-lifecycle|r2-historical-gc/);
   assert.match(finalize, /r2-finalize-lifecycle\.sh finalize/);
   assert.doesNotMatch(finalize, /build-historical-snapshot|r2-checkpoint-lifecycle\.sh promote|r2-historical-gc/);
