@@ -15,7 +15,10 @@ max_report_age_seconds="${R2_CLASSIFICATION_MAX_AGE_SECONDS:-21600}"
 
 write_output() {
   local output_file="$1" key="$2" value="$3"
-  [ -n "$output_file" ] && printf '%s=%s\n' "$key" "$value" >> "$output_file"
+  if [ -n "$output_file" ]; then
+    printf '%s=%s\n' "$key" "$value" >> "$output_file"
+  fi
+  return 0
 }
 
 gate_resume() {
@@ -130,8 +133,14 @@ prepare_resume() {
   return 0
 }
 
-case "${1:-gate}" in
-  gate) gate_resume "${2:-}" ;;
-  prepare) prepare_resume "${2:-}" ;;
-  *) echo "Usage: $0 {gate|prepare} [GITHUB_OUTPUT]" >&2; exit 2 ;;
-esac
+main() {
+  case "${1:-gate}" in
+    gate) gate_resume "${2:-}" ;;
+    prepare) prepare_resume "${2:-}" ;;
+    *) echo "Usage: $0 {gate|prepare} [GITHUB_OUTPUT]" >&2; exit 2 ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
