@@ -95,18 +95,15 @@ PY
 }
 
 abort_multipart_upload_exact() {
-  local key="$1" upload_id="$2" dir out err exists_code
-  if multipart_upload_exists "$key" "$upload_id"; then
-    :
-  else
-    exists_code=$?
-    [ "$exists_code" -eq 1 ] && return 0
-    return 47
-  fi
+  local key="$1" upload_id="$2" dir out err
   dir=$(mktemp -d)
   out="$dir/abort.out"
   err="$dir/abort.err"
   if ! r2_retry_to_files "$out" "$err" s3api abort-multipart-upload --bucket "$bucket" --key "$key" --upload-id "$upload_id"; then
+    if grep -Eiq 'NoSuchUpload|does not exist' "$err"; then
+      rm -r -- "$dir"
+      return 0
+    fi
     if is_transient_r2_error "$err"; then
       echo "::error::Explicit multipart abort exhausted transient retries." >&2
     else
@@ -114,18 +111,6 @@ abort_multipart_upload_exact() {
     fi
     rm -r -- "$dir"
     return 47
-  fi
-  if multipart_upload_exists "$key" "$upload_id"; then
-    echo "::error::Multipart upload still exists after explicit abort." >&2
-    rm -r -- "$dir"
-    return 47
-  else
-    exists_code=$?
-    if [ "$exists_code" -ne 1 ]; then
-      echo "::error::Could not verify multipart disappearance after explicit abort." >&2
-      rm -r -- "$dir"
-      return 47
-    fi
   fi
   rm -r -- "$dir"
 }
@@ -252,9 +237,89 @@ PY
   rm -r -- "$dir"
 }
 
+current_lifecycle_multipart_json() {
+  local dir state_file lease_file descriptor_file descriptor_key active object_key upload_id parts_file err_file part_bytes
+  dir=$(mktemp -d)
+  state_file="$dir/state.json"
+  lease_file="$dir/lease.json"
+  descriptor_file="$dir/descriptor.json"
+  active=false
+
+  if object_exists "$state_key"; then download_object "$state_key" "$state_file"; else printf '{}\n' > "$state_file"; fi
+  if object_exists "$lease_key"; then download_object "$lease_key" "$lease_file"; else printf '{}\n' > "$lease_file"; fi
+  descriptor_key=$(python3 - "$state_file" "$lease_file" <<'PY'
+import datetime,json,sys
+state=json.load(open(sys.argv[1])); lease=json.load(open(sys.argv[2]))
+now=int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+lease_active=lease.get("status","active")=="active" and int(lease.get("expiresEpoch",0))>now
+upload=state.get("upload") or {}
+print(upload.get("descriptorKey","") if lease_active else "")
+PY
+)
+  if [ -n "$descriptor_key" ] && object_exists "$descriptor_key"; then
+    download_object "$descriptor_key" "$descriptor_file"
+    read -r active object_key upload_id < <(python3 - "$descriptor_file" <<'PY'
+import base64,json,sys
+d=json.load(open(sys.argv[1])); active=d.get("status") in {"uploading","abort-failed"}
+enc=lambda value: base64.b64encode(str(value).encode()).decode()
+print(str(active).lower(),enc(d.get("objectKey","")),enc(d.get("uploadId","")))
+PY
+)
+  fi
+  if [ "$active" != true ]; then
+    printf '{"multipartUploads":0,"multipartBytes":0}\n'
+    rm -r -- "$dir"
+    return 0
+  fi
+
+  object_key=$(printf '%s' "$object_key" | base64 --decode)
+  upload_id=$(printf '%s' "$upload_id" | base64 --decode)
+  parts_file="$dir/parts.json"
+  err_file="$dir/parts.err"
+  if ! r2_retry_to_files "$parts_file" "$err_file" s3api list-parts --bucket "$bucket" --key "$object_key" --upload-id "$upload_id" --output json; then
+    if grep -Eiq 'NoSuchUpload|does not exist' "$err_file"; then
+      printf '{"multipartUploads":0,"multipartBytes":0}\n'
+      rm -r -- "$dir"
+      return 0
+    fi
+    rm -r -- "$dir"
+    return 47
+  fi
+  part_bytes=$(python3 -c 'import json,sys; print(sum(int(p.get("Size",0)) for p in json.load(open(sys.argv[1])).get("Parts",[])))' "$parts_file")
+  python3 - "$part_bytes" <<'PY'
+import json,sys
+print(json.dumps({"multipartUploads":1,"multipartBytes":int(sys.argv[1])},separators=(",", ":")))
+PY
+  rm -r -- "$dir"
+}
+
+r2_current_usage_json() {
+  local dir objects object_bytes current multipart_bytes multipart_uploads
+  dir=$(mktemp -d)
+  objects="$dir/objects.json"
+  r2 s3api list-objects-v2 --bucket "$bucket" --output json > "$objects"
+  object_bytes=$(python3 - "$objects" <<'PY'
+import json,sys
+print(sum(int(x.get("Size",0)) for x in json.load(open(sys.argv[1])).get("Contents",[])))
+PY
+)
+  current=$(current_lifecycle_multipart_json)
+  read -r multipart_uploads multipart_bytes < <(python3 - "$current" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1]); print(int(d["multipartUploads"]),int(d["multipartBytes"]))
+PY
+)
+  python3 - "$object_bytes" "$multipart_bytes" "$multipart_uploads" <<'PY'
+import json,sys
+objects,multipart,uploads=map(int,sys.argv[1:])
+print(json.dumps({"objectBytes":objects,"multipartBytes":multipart,"multipartUploads":uploads,"totalBytes":objects+multipart},separators=(",", ":")))
+PY
+  rm -r -- "$dir"
+}
+
 projected_peak_guard() {
   local expected_bytes="$1" same_upload_bytes="${2:-0}" usage peak total uploads multipart
-  usage=$(r2_usage_json)
+  usage=$(r2_current_usage_json)
   read -r total uploads multipart < <(python3 - "$usage" <<'PY'
 import json, sys
 u=json.loads(sys.argv[1]); print(u["totalBytes"],u["multipartUploads"],u["multipartBytes"])
@@ -267,11 +332,11 @@ print(json.dumps({"completedObjectBytes":u["objectBytes"],"unfinishedMultipartBy
 PY
 )")
   echo "R2 measured bytes: $total"
-  echo "Unfinished multipart: $uploads upload(s), $multipart bytes"
+  echo "Current lifecycle unfinished multipart: $uploads upload(s), $multipart bytes"
   echo "Projected peak: $peak"
   echo "Hard limit: $hard_stop_bytes"
   if [ "$uploads" -gt 0 ] && [ "$same_upload_bytes" -eq 0 ]; then
-    echo "::error::Unfinished multipart data exists; abort/GC must resolve it before a new large upload." >&2
+    echo "::error::Current lifecycle unfinished multipart data exists; resolve that upload before a new large upload." >&2
     return 45
   fi
   test "$peak" -lt "$hard_stop_bytes" || {
@@ -396,10 +461,10 @@ PY
 }
 
 write_multipart_state_file() {
-  local state_file="$1" descriptor_key="$2" key="$3" upload_id="$4" expected_bytes="$5" expected_parts="$6" completed_parts="$7" status="$8"
-  python3 - "$state_file" "$descriptor_key" "$key" "$upload_id" "$expected_bytes" "$expected_parts" "$completed_parts" "$status" <<'PY'
+  local state_file="$1" descriptor_key="$2" key="$3" upload_id="$4" expected_bytes="$5" expected_parts="$6" completed_parts="$7" status="$8" source_checksum="$9"
+  python3 - "$state_file" "$descriptor_key" "$key" "$upload_id" "$expected_bytes" "$expected_parts" "$completed_parts" "$status" "$source_checksum" <<'PY'
 import datetime,json,os,sys
-out,descriptor,key,upload_id,expected,parts_total,parts_file,status=sys.argv[1:]
+out,descriptor,key,upload_id,expected,parts_total,parts_file,status,source_checksum=sys.argv[1:]
 parts=[json.loads(x) for x in open(parts_file) if x.strip()]
 now=datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00","Z")
 existing={}
@@ -407,12 +472,14 @@ if os.path.exists(out):
     try: existing=json.load(open(out))
     except Exception: existing={}
 doc={
-    "format":"wall-explorer-multipart-v2",
+    "format":"wall-explorer-multipart-v3",
     "descriptorKey":descriptor,
     "objectKey":key,
     "uploadId":upload_id,
-    "startedAt":existing.get("startedAt",now),
+    "createdAt":existing.get("createdAt",existing.get("startedAt",now)),
+    "startedAt":existing.get("startedAt",existing.get("createdAt",now)),
     "updatedAt":now,
+    "sourceChecksum":{"algorithm":"sha256","value":source_checksum},
     "expectedSize":int(expected),
     "expectedParts":int(parts_total),
     "completedParts":len(parts),
@@ -459,12 +526,12 @@ explicit_multipart_upload() {
     local code=$? abort_code=0
     trap - ERR
     if abort_multipart_upload_exact "$key" "$upload_id"; then
-      write_multipart_state_file "$state_file" "$descriptor_key" "$key" "$upload_id" "$bytes" "$expected_parts" "$completed_parts" aborted
+      write_multipart_state_file "$state_file" "$descriptor_key" "$key" "$upload_id" "$bytes" "$expected_parts" "$completed_parts" aborted "$expected_sha"
       persist_multipart_state "$state_file" "$descriptor_key" || true
       write_durable_stop "Multipart upload failed after bounded retries and was explicitly aborted; the verified canonical checkpoint was retained." || true
     else
       abort_code=47
-      write_multipart_state_file "$state_file" "$descriptor_key" "$key" "$upload_id" "$bytes" "$expected_parts" "$completed_parts" abort-failed
+      write_multipart_state_file "$state_file" "$descriptor_key" "$key" "$upload_id" "$bytes" "$expected_parts" "$completed_parts" abort-failed "$expected_sha"
       persist_multipart_state "$state_file" "$descriptor_key" || true
       write_durable_stop "Multipart upload abort failed; manual recovery is required and the verified canonical checkpoint was retained." || true
     fi
@@ -474,7 +541,7 @@ explicit_multipart_upload() {
   }
   trap upload_failed ERR
 
-  write_multipart_state_file "$state_file" "$descriptor_key" "$key" "$upload_id" "$bytes" "$expected_parts" "$completed_parts" uploading
+  write_multipart_state_file "$state_file" "$descriptor_key" "$key" "$upload_id" "$bytes" "$expected_parts" "$completed_parts" uploading "$expected_sha"
   persist_multipart_state "$state_file" "$descriptor_key"
 
   while [ $((offset_blocks * 8 * 1024 * 1024)) -lt "$bytes" ]; do
@@ -485,7 +552,7 @@ explicit_multipart_upload() {
     r2_retry_to_files "$response" "$response_err" s3api upload-part --bucket "$bucket" --key "$key" --upload-id "$upload_id" --part-number "$part" --body "$temp" --output json
     etag=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ETag"])' "$response")
     printf '{"PartNumber":%s,"ETag":%s,"Size":%s}\n' "$part" "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$etag")" "$(stat -c '%s' "$temp")" >> "$completed_parts"
-    write_multipart_state_file "$state_file" "$descriptor_key" "$key" "$upload_id" "$bytes" "$expected_parts" "$completed_parts" uploading
+    write_multipart_state_file "$state_file" "$descriptor_key" "$key" "$upload_id" "$bytes" "$expected_parts" "$completed_parts" uploading "$expected_sha"
     persist_multipart_state "$state_file" "$descriptor_key"
     rm -f -- "$temp"
     offset_blocks=$((offset_blocks + part_mib / 8))
@@ -500,13 +567,13 @@ PY
   trap - ERR
   if ! verify_remote_object "$key" "$bytes" "$expected_sha"; then
     r2_destructive s3api delete-object --bucket "$bucket" --key "$key" >/dev/null 2>&1 || true
-    write_multipart_state_file "$state_file" "$descriptor_key" "$key" "$upload_id" "$bytes" "$expected_parts" "$completed_parts" failed-verification
+    write_multipart_state_file "$state_file" "$descriptor_key" "$key" "$upload_id" "$bytes" "$expected_parts" "$completed_parts" failed-verification "$expected_sha"
     persist_multipart_state "$state_file" "$descriptor_key" || true
     write_durable_stop "Completed multipart object failed verification and was removed; the verified canonical checkpoint was retained." || true
     rm -r -- "$dir"
     return 46
   fi
-  write_multipart_state_file "$state_file" "$descriptor_key" "$key" "$upload_id" "$bytes" "$expected_parts" "$completed_parts" completed
+  write_multipart_state_file "$state_file" "$descriptor_key" "$key" "$upload_id" "$bytes" "$expected_parts" "$completed_parts" completed "$expected_sha"
   persist_multipart_state "$state_file" "$descriptor_key"
   rm -r -- "$dir"
 }

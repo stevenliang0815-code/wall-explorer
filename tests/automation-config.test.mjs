@@ -81,26 +81,24 @@ test("Promotion, Finalize, and GC have separate large-object responsibilities", 
   assert.doesNotMatch(gc, /build-historical-snapshot|r2-finalize-lifecycle\.sh finalize/);
 });
 
-test("authorized resume fails closed, removes only the stop marker, and enables continuation", async () => {
+test("current-only resume is independent from Legacy GC and dispatches only the final segment", async () => {
   const resume = await readFile(".github/workflows/historical-resume.yml", "utf8");
-  const promotion = await readFile(".github/workflows/historical-checkpoint-promotion.yml", "utf8");
-  const gate = resume.indexOf("Final read-only R2 gate");
+  const gateScript = await readFile("scripts/r2-historical-resume-current.sh", "utf8");
   const remove = resume.indexOf('delete-object --bucket "$bucket" --key "$stop_key"');
   const dispatch = resume.indexOf("gh workflow run historical-backfill.yml");
 
-  assert.match(resume, /push:\n\s+branches: \[main\]/);
-  assert.doesNotMatch(resume, /workflow_dispatch/);
+  assert.match(resume, /workflow_run:/);
+  assert.match(resume, /Historical Multipart Private Classification/);
   assert.match(resume, /group: wall-explorer-historical-snapshot/);
-  assert.match(resume, /Expected durable stop marker is absent/);
-  assert.match(resume, /multipartUploads,d\.multipartBytes/);
-  assert.match(resume, /r2-checkpoint-lifecycle\.sh projected-peak/);
-  assert.match(resume, /r2-historical-gc\.sh plan/);
-  assert.match(resume, /put_json_cas "\$stop_backup" "\$stop_key" ABSENT/);
-  assert.ok(gate >= 0 && gate < remove && remove < dispatch, "all gates must pass before the exact stop marker is removed and Backfill is dispatched");
+  assert.match(gateScript, /current_lifecycle_multipart_json/);
+  assert.match(gateScript, /unfinishedUploads/);
+  assert.match(gateScript, /projected_peak_guard/);
+  assert.match(gateScript, /99\.69/);
+  assert.ok(remove >= 0 && remove < dispatch, "the stop marker is removed only immediately before final-segment dispatch");
   const deleteLines = resume.split("\n").filter((line) => line.includes("delete-object")).join("\n");
   assert.doesNotMatch(deleteLines, /builder\.sqlite|candidate|checkpoint/);
-  assert.match(promotion, /ENABLE_HISTORICAL_BACKFILL: "true"/);
-  assert.match(promotion, /\[ "\$state" != BACKFILLING \] \|\| gh workflow run historical-backfill\.yml/);
+  assert.match(resume, /--field batch_dates=2 --field max_cycles=0/);
+  assert.doesNotMatch(resume, /r2-legacy-multipart-gc\.sh gc/);
 });
 
 test("CI wrappers do not require the environment helper to have an executable bit", async () => {
@@ -125,6 +123,9 @@ test("R2 lifecycle uses CAS, explicit multipart abort, cleanup gate, and immutab
   assert.match(common, /408\|429\|500\|502\|503\|504/);
   assert.match(common, /connection \(reset\|closed\|aborted\)/);
   assert.match(common, /write_multipart_state_file/);
+  assert.match(common, /wall-explorer-multipart-v3/);
+  assert.match(common, /sourceChecksum/);
+  assert.match(common, /current_lifecycle_multipart_json/);
   assert.match(common, /"parts":\[/);
   assert.match(common, /abort_multipart_upload_exact "\$key" "\$upload_id"/);
   assert.match(common, /write_durable_stop/);
@@ -137,10 +138,12 @@ test("R2 lifecycle uses CAS, explicit multipart abort, cleanup gate, and immutab
   assert.doesNotMatch(`${checkpoint}\n${finalize}`, /copy-object|s3 cp "s3:\/\/[^ ]+" "s3:\//);
 });
 
-test("Backfill 38 recovery chain is decommissioned and private classification is independent", async () => {
+test("Backfill 38 recovery is decommissioned and Legacy GC is an independent bounded workflow", async () => {
   const workflow = await readFile(".github/workflows/historical-backfill38-recovery.yml", "utf8");
   const classification = await readFile(".github/workflows/historical-multipart-classification.yml", "utf8");
   const scanner = await readFile("scripts/r2-legacy-multipart-gc.sh", "utf8");
+  const gc = await readFile(".github/workflows/historical-legacy-multipart-gc.yml", "utf8");
+  const lifecycleRule = await readFile("scripts/r2-historical-lifecycle-rule.sh", "utf8");
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /permissions:\n\s+contents: read/);
   assert.doesNotMatch(workflow, /schedule:|actions: write|abort-multipart-upload|gh workflow run/);
@@ -153,7 +156,17 @@ test("Backfill 38 recovery chain is decommissioned and private classification is
   assert.match(scanner, /IsTruncated=false/);
   assert.match(scanner, /classification_key="jobs\/historical\/legacy-multipart-gc\/classification\.json"/);
   assert.match(scanner, /put_json_cas "\$report_file" "\$classification_key"/);
-  assert.doesNotMatch(scanner, /abort-multipart-upload|delete-object|gh workflow run/);
+  assert.match(scanner, /abort_legacy_upload_exact/);
+  assert.match(scanner, /R2_LEGACY_ABORT_CONCURRENCY/);
+  assert.match(scanner, /NoSuchUpload/);
+  assert.match(scanner, /cursor_key="jobs\/historical\/legacy-multipart-gc\/cursor\.json"/);
+  assert.doesNotMatch(scanner, /delete-object/);
+  assert.match(gc, /group: wall-explorer-historical-legacy-multipart-gc/);
+  assert.match(gc, /Full paginated Legacy Multipart GC/);
+  assert.doesNotMatch(gc, /actions: write|gh workflow run|historical-backfill\.yml|historical-finalize\.yml/);
+  assert.match(lifecycleRule, /AbortIncompleteMultipartUpload/);
+  assert.match(lifecycleRule, /checkpoints\/historical\/versions\//);
+  assert.match(lifecycleRule, /get-bucket-lifecycle-configuration/);
 });
 
 test("dry-run measures pending promotion without simulating a forbidden third raw", async () => {
@@ -161,7 +174,8 @@ test("dry-run measures pending promotion without simulating a forbidden third ra
   assert.match(workflow, /pending-checkpoint\.json/);
   assert.match(workflow, /expected_bytes=0/);
   assert.match(workflow, /forbidden third raw/);
-  assert.match(workflow, /multipart_uploads/);
+  assert.doesNotMatch(workflow, /r2-backfill38-recovery\.sh preflight/);
+  assert.match(workflow, /current lifecycle/i);
   assert.match(workflow, /r2-checkpoint-lifecycle\.sh projected-peak/);
   assert.match(workflow, /tests\/automation-config\.test\.mjs/);
 });
