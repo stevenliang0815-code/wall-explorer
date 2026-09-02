@@ -67,7 +67,9 @@ jobs:
           if int(d.get("multipartUploads",-1)) != 0 or int(d.get("multipartBytes",-1)) != 0:
               raise SystemExit("Current lifecycle has unfinished multipart data")
           PY
-          echo "stop_etag=$(object_etag "$stop_key")" >> "$GITHUB_OUTPUT"
+          stop_etag=$(object_etag "$stop_key" | tr -d '"')
+          test -n "$stop_etag"
+          echo "stop_etag=$stop_etag" >> "$GITHUB_OUTPUT"
           echo "ready=true" >> "$GITHUB_OUTPUT"
       - name: Remove only the exact false-positive stop marker
         if: steps.gate.outputs.ready == 'true'
@@ -75,7 +77,7 @@ jobs:
         run: |
           set -euo pipefail
           source scripts/r2-historical-common.sh
-          test "$(object_etag "$stop_key")" = "${{ steps.gate.outputs.stop_etag }}"
+          test "$(object_etag "$stop_key" | tr -d '"')" = "${{ steps.gate.outputs.stop_etag }}"
           r2_destructive s3api delete-object --bucket "$bucket" --key "$stop_key" >/dev/null
           object_exists "$stop_key" && { echo "::error::Stop marker still exists after exact delete." >&2; exit 1; }
       - name: Dispatch Finalize from the preserved 100% raw

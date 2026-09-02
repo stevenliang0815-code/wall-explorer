@@ -96,6 +96,7 @@ test("Finalize false-positive recovery is exact, current-only, and dispatches no
   assert.match(resume, /raw-100-percent/);
   assert.match(resume, /f70fa2abf1d4d1b09c1d1117b0ac67e380ec0f4e1d9e8f1deb53c71d9225ea9e/);
   assert.match(resume, /current_lifecycle_multipart_json/);
+  assert.match(resume, /object_etag "\$stop_key" \| tr -d/);
   assert.match(resume, /delete-object --bucket "\$bucket" --key "\$stop_key"/);
   assert.match(resume, /gh workflow run historical-finalize\.yml/);
   assert.doesNotMatch(resume, /historical-backfill\.yml|latest\.json.*delete-object/);
