@@ -56,14 +56,21 @@ jobs:
       - name: Release promotion lease
         if: always() && steps.pause.outputs.stopped != 'true' && steps.pause.outputs.pending == 'true'
         run: bash scripts/r2-checkpoint-lifecycle.sh release-lease "promotion-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-      - name: Continue only when explicitly enabled and state requests backfill
-        if: success() && steps.pause.outputs.stopped != 'true' && steps.pause.outputs.pending == 'true' && env.ENABLE_HISTORICAL_BACKFILL == 'true'
+      - name: Explicitly dispatch the durable next lifecycle action
+        if: success() && steps.pause.outputs.stopped != 'true' && env.ENABLE_HISTORICAL_BACKFILL == 'true'
         run: |
           set -euo pipefail
           export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" AWS_DEFAULT_REGION=auto AWS_EC2_METADATA_DISABLED=true AWS_PAGER=""
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           state=$(aws --endpoint-url "$endpoint" s3 cp "s3://${R2_BUCKET}/jobs/historical/state.json" - --only-show-errors | jq -r .state)
-          [ "$state" != BACKFILLING ] || gh workflow run historical-backfill.yml --repo "$GITHUB_REPOSITORY" --ref main
+          case "$state" in
+            BACKFILLING)
+              [ "${{ steps.pause.outputs.pending }}" = true ] && gh workflow run historical-backfill.yml --repo "$GITHUB_REPOSITORY" --ref main
+              ;;
+            RAW_100_PERCENT)
+              gh workflow run historical-finalize.yml --repo "$GITHUB_REPOSITORY" --ref main
+              ;;
+          esac
       - name: Record promotion failure
         if: failure()
         run: bash scripts/r2-checkpoint-lifecycle.sh record-stop "Checkpoint verification, CAS promotion, or cleanup failed in run ${GITHUB_RUN_ID}."
