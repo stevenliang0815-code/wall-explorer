@@ -91,6 +91,11 @@ test("Promotion, Finalize, and GC have separate large-object responsibilities", 
 test("Finalize false-positive recovery is exact, current-only, and dispatches no Backfill", async () => {
   const resume = await readFile(".github/workflows/historical-finalize-resume.yml", "utf8");
   assert.match(resume, /EXPECTED_FAILED_RUN: "33626866041"/);
+  assert.match(resume, /EXPECTED_INTERRUPTED_RESUME_RUN: "33628848622"/);
+  assert.match(resume, /actions\/runs\/\$\{EXPECTED_INTERRUPTED_RESUME_RUN\}\/jobs/);
+  assert.match(resume, /Exact read-only false-positive recovery gate":"success"/);
+  assert.match(resume, /Remove only the exact false-positive stop marker":"failure"/);
+  assert.match(resume, /Dispatch Finalize from the preserved 100% raw":"skipped"/);
   assert.match(resume, /expected_reason=f"Finalize failed in run \{expected_run\}/);
   assert.match(resume, /FINALIZING/);
   assert.match(resume, /raw-100-percent/);
@@ -98,6 +103,7 @@ test("Finalize false-positive recovery is exact, current-only, and dispatches no
   assert.match(resume, /current_lifecycle_multipart_json/);
   assert.match(resume, /object_etag "\$stop_key" \| tr -d/);
   assert.match(resume, /delete-object --bucket "\$bucket" --key "\$stop_key"/);
+  assert.match(resume, /if object_exists "\$stop_key"; then/);
   assert.match(resume, /gh workflow run historical-finalize\.yml/);
   assert.doesNotMatch(resume, /historical-backfill\.yml|latest\.json.*delete-object/);
 });
