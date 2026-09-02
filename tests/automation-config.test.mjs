@@ -67,6 +67,7 @@ test("Backfill restores first and uploads one pending immutable checkpoint witho
 test("Promotion, Finalize, and GC have separate large-object responsibilities", async () => {
   const promotion = await readFile(".github/workflows/historical-checkpoint-promotion.yml", "utf8");
   const finalize = await readFile(".github/workflows/historical-finalize.yml", "utf8");
+  const finalizeScript = await readFile("scripts/r2-finalize-lifecycle.sh", "utf8");
   const gc = await readFile(".github/workflows/historical-garbage-collection.yml", "utf8");
   for (const workflow of [promotion, finalize, gc]) assert.match(workflow, /group: wall-explorer-historical-snapshot/);
   assert.match(promotion, /r2-checkpoint-lifecycle\.sh promote/);
@@ -78,10 +79,26 @@ test("Promotion, Finalize, and GC have separate large-object responsibilities", 
   assert.match(promotion, /steps\.pause\.outputs\.pending \}\}" = true/);
   assert.doesNotMatch(promotion, /build-historical-snapshot|r2-finalize-lifecycle|r2-historical-gc/);
   assert.match(finalize, /r2-finalize-lifecycle\.sh finalize/);
+  assert.match(finalizeScript, /status NOT IN \('completed','validated_empty'\)/);
+  assert.match(finalizeScript, /FINALIZE_SEMANTIC_COUNTS/);
+  assert.doesNotMatch(finalizeScript, /status!='completed'/);
   assert.doesNotMatch(finalize, /build-historical-snapshot|r2-checkpoint-lifecycle\.sh promote|r2-historical-gc/);
   assert.match(gc, /r2-historical-gc\.sh plan/);
   assert.match(gc, /GC_APPLY: "true"/);
   assert.doesNotMatch(gc, /build-historical-snapshot|r2-finalize-lifecycle\.sh finalize/);
+});
+
+test("Finalize false-positive recovery is exact, current-only, and dispatches no Backfill", async () => {
+  const resume = await readFile(".github/workflows/historical-finalize-resume.yml", "utf8");
+  assert.match(resume, /EXPECTED_FAILED_RUN: "33626866041"/);
+  assert.match(resume, /expected_reason=f"Finalize failed in run \{expected_run\}/);
+  assert.match(resume, /FINALIZING/);
+  assert.match(resume, /raw-100-percent/);
+  assert.match(resume, /f70fa2abf1d4d1b09c1d1117b0ac67e380ec0f4e1d9e8f1deb53c71d9225ea9e/);
+  assert.match(resume, /current_lifecycle_multipart_json/);
+  assert.match(resume, /delete-object --bucket "\$bucket" --key "\$stop_key"/);
+  assert.match(resume, /gh workflow run historical-finalize\.yml/);
+  assert.doesNotMatch(resume, /historical-backfill\.yml|latest\.json.*delete-object/);
 });
 
 test("current-only resume is independent from Legacy GC and dispatches only the final segment", async () => {
