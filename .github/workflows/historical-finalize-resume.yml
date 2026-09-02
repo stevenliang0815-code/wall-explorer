@@ -1,0 +1,89 @@
+name: Historical Finalize Exact Resume
+
+"on":
+  push:
+    branches: [main]
+    paths: [.github/workflows/historical-finalize-resume.yml]
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: wall-explorer-historical-snapshot
+  cancel-in-progress: false
+
+jobs:
+  resume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+      EXPECTED_RAW_SHA: f70fa2abf1d4d1b09c1d1117b0ac67e380ec0f4e1d9e8f1deb53c71d9225ea9e
+      EXPECTED_FAILED_RUN: "33626866041"
+
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m pip install --disable-pip-version-check awscli
+      - name: Exact read-only false-positive recovery gate
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/r2-historical-common.sh
+          dir=$(mktemp -d)
+          trap 'rm -r -- "$dir"' EXIT
+          object_exists "$stop_key"
+          download_object "$stop_key" "$dir/stop.json"
+          download_object "$state_key" "$dir/state.json"
+          download_object "$checkpoint_pointer_key" "$dir/pointer.json"
+          if object_exists "$lease_key"; then download_object "$lease_key" "$dir/lease.json"; else printf '{}\n' > "$dir/lease.json"; fi
+          python3 - "$dir/stop.json" "$dir/state.json" "$dir/pointer.json" "$dir/lease.json" "$EXPECTED_FAILED_RUN" "$EXPECTED_RAW_SHA" <<'PY'
+          import datetime,json,sys
+          stop,state,pointer,lease=(json.load(open(p)) for p in sys.argv[1:5])
+          expected_run,expected_sha=sys.argv[5:]
+          expected_reason=f"Finalize failed in run {expected_run}; the verified raw checkpoint remains recoverable."
+          if str(stop.get("runId")) != expected_run or stop.get("reason") != expected_reason:
+              raise SystemExit("Durable stop is not the exact authorized false-positive Finalize failure")
+          if state.get("state") != "FINALIZING" or state.get("upload") not in (None, {}):
+              raise SystemExit("Lifecycle is not safely resumable from FINALIZING")
+          if pointer.get("status") != "raw-100-percent" or float(pointer.get("progress",-1)) != 100:
+              raise SystemExit("Verified raw pointer is not at 100%")
+          if pointer.get("sha256") != expected_sha or expected_sha not in pointer.get("objectKey",""):
+              raise SystemExit("Verified raw pointer changed")
+          now=int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+          if lease.get("status","released") == "active" and int(lease.get("expiresEpoch",0)) > now:
+              raise SystemExit("An active lifecycle lease exists")
+          PY
+          current=$(current_lifecycle_multipart_json)
+          python3 - "$current" <<'PY'
+          import json,sys
+          d=json.loads(sys.argv[1])
+          if int(d.get("multipartUploads",-1)) != 0 or int(d.get("multipartBytes",-1)) != 0:
+              raise SystemExit("Current lifecycle has unfinished multipart data")
+          PY
+          echo "stop_etag=$(object_etag "$stop_key")" >> "$GITHUB_OUTPUT"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+      - name: Remove only the exact false-positive stop marker
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source scripts/r2-historical-common.sh
+          test "$(object_etag "$stop_key")" = "${{ steps.gate.outputs.stop_etag }}"
+          r2_destructive s3api delete-object --bucket "$bucket" --key "$stop_key" >/dev/null
+          object_exists "$stop_key" && { echo "::error::Stop marker still exists after exact delete." >&2; exit 1; }
+      - name: Dispatch Finalize from the preserved 100% raw
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh workflow run historical-finalize.yml --repo "$GITHUB_REPOSITORY" --ref main; then
+            bash scripts/r2-checkpoint-lifecycle.sh record-stop "Finalize resume dispatch failed after exact false-positive recovery."
+            exit 1
+          fi
