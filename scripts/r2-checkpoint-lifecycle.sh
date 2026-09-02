@@ -368,9 +368,10 @@ case "$operation" in
   upload) upload_checkpoint ;;
   promote) promote_pending ;;
   usage-json) r2_usage_json ;;
+  current-usage-json) r2_current_usage_json ;;
   projected-peak) projected_peak_guard "${2:?expected bytes required}" "${3:-0}" ;;
   acquire-lease) acquire_lease "${2:?owner required}" "${3:?purpose required}" ;;
   release-lease) release_lease "${2:?owner required}" ;;
   record-stop) record_stop "${2:-Historical lifecycle stopped}" ;;
-  *) echo "Usage: $0 {restore|resolve|upload|promote|usage-json|projected-peak|acquire-lease|release-lease|record-stop}" >&2; exit 2 ;;
+  *) echo "Usage: $0 {restore|resolve|upload|promote|usage-json|current-usage-json|projected-peak|acquire-lease|release-lease|record-stop}" >&2; exit 2 ;;
 esac

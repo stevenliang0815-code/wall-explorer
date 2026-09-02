@@ -93,10 +93,13 @@ test("multipart durable state includes upload ID and per-part ETag/bytes", async
       set -euo pipefail
       source scripts/r2-historical-common.sh
       printf '%s\n' '{"PartNumber":1,"ETag":"etag-1","Size":256}' '{"PartNumber":2,"ETag":"etag-2","Size":128}' > "$PARTS"
-      write_multipart_state_file "$STATE" descriptor.json immutable.sqlite upload-123 384 2 "$PARTS" uploading
+      write_multipart_state_file "$STATE" descriptor.json immutable.sqlite upload-123 384 2 "$PARTS" uploading abc123
     `], { env: { ...env, PARTS: parts, STATE: state } });
     const document = JSON.parse(await readFile(state, "utf8"));
     assert.equal(document.uploadId, "upload-123");
+    assert.equal(document.format, "wall-explorer-multipart-v3");
+    assert.ok(document.createdAt);
+    assert.deepEqual(document.sourceChecksum, { algorithm: "sha256", value: "abc123" });
     assert.equal(document.completedParts, 2);
     assert.equal(document.completedBytes, 384);
     assert.deepEqual(document.parts, [
