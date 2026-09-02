@@ -48,7 +48,7 @@ scan_all_multipart_uploads() {
     read -r key_marker_b64 upload_marker_b64 page complete < <(python3 - "$cursor_file" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
-print(d.get("keyMarkerB64", "-"), d.get("uploadIdMarkerB64", "-"), int(d.get("page", 0)), str(bool(d.get("complete",False))).lower())
+print(d.get("keyMarkerB64") or "-", d.get("uploadIdMarkerB64") or "-", int(d.get("page", 0)), str(bool(d.get("complete",False))).lower())
 PY
 )
     [ "$key_marker_b64" != - ] || key_marker_b64=""

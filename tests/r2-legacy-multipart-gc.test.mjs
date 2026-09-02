@@ -115,3 +115,25 @@ test("Legacy GC treats NoSuchUpload as an idempotent exact-abort success", async
   `], { env });
   assert.match(stdout, /success/);
 });
+
+test("scanner accepts the durable reset cursor with empty markers", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "legacy-reset-"));
+  try {
+    const output = path.join(dir, "uploads.tsv");
+    const cursor = path.join(dir, "cursor.json");
+    await writeFile(output, "");
+    await writeFile(cursor, '{"keyMarkerB64":"","uploadIdMarkerB64":"","page":0,"complete":false}\n');
+    const { stdout } = await run("bash", ["-c", String.raw`
+      set -euo pipefail
+      aws() { printf '%s\n' '{"Uploads":[]}'; }
+      source scripts/r2-legacy-multipart-gc.sh
+      scan_all_multipart_uploads "$OUTPUT" "$CURSOR"
+    `], { env: { ...env, OUTPUT: output, CURSOR: cursor } });
+    assert.equal(stdout.trim(), "1");
+    const durable = JSON.parse(await readFile(cursor, "utf8"));
+    assert.equal(durable.page, 1);
+    assert.equal(durable.complete, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

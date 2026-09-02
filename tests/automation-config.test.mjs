@@ -88,6 +88,7 @@ test("current-only resume is independent from Legacy GC and dispatches only the 
   const dispatch = resume.indexOf("gh workflow run historical-backfill.yml");
 
   assert.match(resume, /workflow_run:/);
+  assert.match(resume, /push:\n\s+branches: \[main\]/);
   assert.match(resume, /Historical Multipart Private Classification/);
   assert.match(resume, /group: wall-explorer-historical-snapshot/);
   assert.match(gateScript, /current_lifecycle_multipart_json/);
