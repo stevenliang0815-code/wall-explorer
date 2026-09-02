@@ -124,6 +124,16 @@ test("transient classifier covers required HTTP statuses and connection failures
   assert.equal(stdout.trim().split("\n").length, 8);
 });
 
+test("Resume output helper is a successful no-op without GITHUB_OUTPUT", async () => {
+  const { stdout } = await execFile("bash", ["-c", String.raw`
+    set -euo pipefail
+    source scripts/r2-historical-resume-current.sh
+    write_output "" eligible true
+    echo ok
+  `], { env });
+  assert.equal(stdout.trim(), "ok");
+});
+
 test("Backfill recovery dispatch classifies GitHub network failures as transient", async () => {
   const { stdout } = await execFile("bash", ["-c", String.raw`
     set -euo pipefail
