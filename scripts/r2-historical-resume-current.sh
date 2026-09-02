@@ -127,6 +127,7 @@ prepare_resume() {
   if [ "$state" = CHECKPOINT_UPLOADING ]; then
     state_transition BACKFILLING '{"cleanupPending":false,"upload":null}'
   fi
+  return 0
 }
 
 case "${1:-gate}" in
