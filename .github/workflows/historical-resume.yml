@@ -2,6 +2,11 @@ name: Resume Historical Snapshot Backfill
 
 "on":
   workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/historical-resume.yml"
+      - "scripts/r2-historical-resume-current.sh"
   workflow_run:
     workflows: ["Historical Multipart Private Classification"]
     types: [completed]
