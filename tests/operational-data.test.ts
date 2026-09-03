@@ -54,6 +54,7 @@ test("operational rebuild is separate and never triggers Historical lifecycle", 
   const workflow = await readFile(".github/workflows/operational-rebuild.yml", "utf8");
   const importer = await readFile("scripts/import-operational-generation.mjs", "utf8");
   assert.match(workflow, /snapshots\/historical\/latest\.json/);
+  assert.match(workflow, /push:\n\s+branches: \[main\]/);
   assert.match(workflow, /Build shadow generation, catch up, and atomically activate/);
   assert.doesNotMatch(workflow, /historical-backfill\.yml|historical-finalize\.yml|gh workflow run/);
   assert.match(importer, /action: "validate"/);
