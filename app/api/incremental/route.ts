@@ -1,24 +1,16 @@
 import { getRawDb } from "../../../db";
 import { auditBiasGuards, fetchHistoricalMarketDay, type HistoricalMarket, type HistoricalObservation } from "../../../lib/historical-data";
+import { fetchMarketPulse } from "../../../lib/official-data";
+import { freshnessStatus, latestCompletedMarketDate, nextWeekday } from "../../../lib/operational-time";
 
 export const dynamic = "force-dynamic";
 const markets: HistoricalMarket[] = ["上市", "上櫃"];
 
-function latestCompletedMarketDate() {
-  const taipei = new Date(Date.now() + 8 * 60 * 60_000);
-  if (taipei.getUTCHours() < 17) taipei.setUTCDate(taipei.getUTCDate() - 1);
-  while ([0, 6].includes(taipei.getUTCDay())) taipei.setUTCDate(taipei.getUTCDate() - 1);
-  return taipei.toISOString().slice(0, 10);
+function authorized(request: Request) {
+  return request.headers.get("OAI-Sites-Authorization")?.startsWith("Bearer ") || request.headers.get("x-wall-incremental-trigger") === "scheduled";
 }
 
-function nextWeekday(date: string) {
-  const cursor = new Date(`${date}T12:00:00Z`);
-  do cursor.setUTCDate(cursor.getUTCDate() + 1);
-  while ([0, 6].includes(cursor.getUTCDay()));
-  return cursor.toISOString().slice(0, 10);
-}
-
-function payloads(rows: HistoricalObservation[], target = 700_000) {
+function payloads(rows: HistoricalObservation[], target = 600_000) {
   const result: string[] = []; let current: HistoricalObservation[] = []; let bytes = 2;
   for (const row of rows) {
     const encoded = JSON.stringify(row);
@@ -29,65 +21,170 @@ function payloads(rows: HistoricalObservation[], target = 700_000) {
   return result;
 }
 
-function observationUpsert(d1: D1Database, payload: string, now: string) {
-  return d1.prepare(`INSERT INTO historical_observations (market,code,name,trading_date,security_type,universe_status,open,high,low,close,change,volume,trade_value,source,source_scope,usable_from,ingested_at,backfill_job_id)
-    SELECT json_extract(value,'$.market'),json_extract(value,'$.code'),json_extract(value,'$.name'),json_extract(value,'$.tradingDate'),json_extract(value,'$.securityType'),json_extract(value,'$.universeStatus'),json_extract(value,'$.open'),json_extract(value,'$.high'),json_extract(value,'$.low'),json_extract(value,'$.close'),json_extract(value,'$.change'),json_extract(value,'$.volume'),json_extract(value,'$.tradeValue'),json_extract(value,'$.source'),json_extract(value,'$.sourceScope'),json_extract(value,'$.usableFrom'),?,-2 FROM json_each(?) WHERE 1
-    ON CONFLICT(market,code,trading_date) DO UPDATE SET name=excluded.name,security_type=excluded.security_type,universe_status=excluded.universe_status,open=excluded.open,high=excluded.high,low=excluded.low,close=excluded.close,change=excluded.change,volume=excluded.volume,trade_value=excluded.trade_value,source=excluded.source,source_scope=excluded.source_scope,usable_from=excluded.usable_from,ingested_at=excluded.ingested_at`).bind(now,payload);
+async function sha256(value: string) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function state() {
-  const d1 = await getRawDb();
-  const snapshot = await d1.prepare("SELECT status,cutoff_date AS cutoffDate,snapshot_version AS snapshotVersion FROM historical_snapshot_imports WHERE id=1").first<{ status: string; cutoffDate: string; snapshotVersion: string }>();
+function barUpsert(d1: D1Database, generationId: string, payload: string, now: string) {
+  return d1.prepare(`INSERT INTO operational_daily_bars
+    (generation_id,market,code,trading_date,open,high,low,close,change,volume,trade_value,source,ingested_at)
+    SELECT ?,json_extract(value,'$.market'),json_extract(value,'$.code'),json_extract(value,'$.tradingDate'),
+      json_extract(value,'$.open'),json_extract(value,'$.high'),json_extract(value,'$.low'),json_extract(value,'$.close'),
+      json_extract(value,'$.change'),json_extract(value,'$.volume'),json_extract(value,'$.tradeValue'),json_extract(value,'$.source'),?
+    FROM json_each(?) WHERE json_extract(value,'$.securityType')='ordinary_equity_candidate'
+    ON CONFLICT(generation_id,market,code,trading_date) DO UPDATE SET open=excluded.open,high=excluded.high,
+      low=excluded.low,close=excluded.close,change=excluded.change,volume=excluded.volume,trade_value=excluded.trade_value,
+      source=excluded.source,ingested_at=excluded.ingested_at`).bind(generationId, now, payload);
+}
+
+function quoteUpsert(d1: D1Database, generationId: string, payload: string, now: string) {
+  return d1.prepare(`INSERT INTO operational_latest_quotes
+    (generation_id,market,code,name,security_type,trading_date,open,high,low,close,change,volume,trade_value,source,ingested_at)
+    SELECT ?,json_extract(value,'$.market'),json_extract(value,'$.code'),json_extract(value,'$.name'),
+      json_extract(value,'$.securityType'),json_extract(value,'$.tradingDate'),json_extract(value,'$.open'),
+      json_extract(value,'$.high'),json_extract(value,'$.low'),json_extract(value,'$.close'),json_extract(value,'$.change'),
+      json_extract(value,'$.volume'),json_extract(value,'$.tradeValue'),json_extract(value,'$.source'),?
+    FROM json_each(?) WHERE 1 ON CONFLICT(generation_id,market,code) DO UPDATE SET name=excluded.name,
+      security_type=excluded.security_type,trading_date=excluded.trading_date,open=excluded.open,high=excluded.high,
+      low=excluded.low,close=excluded.close,change=excluded.change,volume=excluded.volume,trade_value=excluded.trade_value,
+      source=excluded.source,ingested_at=excluded.ingested_at WHERE excluded.trading_date>=operational_latest_quotes.trading_date`)
+    .bind(generationId, now, payload);
+}
+
+function securityUpsert(d1: D1Database, generationId: string, payload: string) {
+  return d1.prepare(`INSERT INTO operational_securities
+    (generation_id,market,code,name,security_type,first_seen,last_seen)
+    SELECT ?,json_extract(value,'$.market'),json_extract(value,'$.code'),json_extract(value,'$.name'),
+      json_extract(value,'$.securityType'),json_extract(value,'$.tradingDate'),json_extract(value,'$.tradingDate')
+    FROM json_each(?) WHERE 1 ON CONFLICT(generation_id,market,code) DO UPDATE SET name=excluded.name,
+      security_type=excluded.security_type,first_seen=min(first_seen,excluded.first_seen),last_seen=max(last_seen,excluded.last_seen)`)
+    .bind(generationId, payload);
+}
+
+async function completedThrough(d1: D1Database, generationId: string) {
   const checkpoint = await d1.prepare(`SELECT max(trading_date) AS tradingDate FROM (
-    SELECT trading_date FROM daily_incremental_runs GROUP BY trading_date
-    HAVING count(*)=2 AND sum(CASE WHEN status IN ('complete','empty') THEN 1 ELSE 0 END)=2
-  )`).first<{ tradingDate: string | null }>();
-  const runs = await d1.prepare("SELECT market,trading_date AS tradingDate,status,rows_written AS rowsWritten,attempts,last_error AS lastError,updated_at AS updatedAt FROM daily_incremental_runs ORDER BY trading_date DESC,market LIMIT 4").all();
-  return { snapshot, lastCompletedDate: checkpoint?.tradingDate ?? null, runs: runs.results };
+    SELECT trading_date FROM operational_ingestion_units WHERE generation_id=? GROUP BY trading_date
+    HAVING count(*)=2 AND sum(CASE WHEN status IN ('complete','validated_empty') THEN 1 ELSE 0 END)=2
+  )`).bind(generationId).first<{ tradingDate: string | null }>();
+  return checkpoint?.tradingDate ?? null;
+}
+
+async function state(d1: D1Database, requestedGeneration?: string | null) {
+  const active = await d1.prepare(`SELECT active_generation AS activeGeneration,retention_trading_days AS retentionTradingDays,
+    latest_completed_date AS latestCompletedDate,freshness_status AS freshnessStatus,last_incremental_at AS lastIncrementalAt,
+    updated_at AS updatedAt FROM operational_state WHERE id=1`).first<{
+      activeGeneration: string | null; retentionTradingDays: number; latestCompletedDate: string | null;
+      freshnessStatus: string; lastIncrementalAt: string | null; updatedAt: string;
+    }>();
+  const generationId = requestedGeneration ?? active?.activeGeneration ?? null;
+  const generation = generationId ? await d1.prepare(`SELECT generation_id AS generationId,status,base_last_date AS baseLastDate,
+    retention_trading_days AS retentionTradingDays FROM operational_generations WHERE generation_id=?`).bind(generationId)
+    .first<{ generationId: string; status: string; baseLastDate: string; retentionTradingDays: number }>() : null;
+  const throughDate = generation ? (await completedThrough(d1, generation.generationId)) ?? generation.baseLastDate : null;
+  const runs = generation ? await d1.prepare(`SELECT market,trading_date AS tradingDate,status,rows_stored AS rowsStored,
+    attempts,last_error AS lastError,updated_at AS updatedAt FROM operational_ingestion_units
+    WHERE generation_id=? ORDER BY trading_date DESC,market LIMIT 8`).bind(generation.generationId).all() : { results: [] };
+  return { mode: "operational_incremental", active, generation, lastCompletedDate: throughDate, runs: runs.results };
 }
 
 export async function GET() {
-  try { return Response.json(await state(), { headers: { "Cache-Control": "no-store" } }); }
-  catch { return Response.json({ snapshot: null, runs: [] }, { status: 503 }); }
+  try { return Response.json(await state(await getRawDb()), { headers: { "Cache-Control": "no-store" } }); }
+  catch { return Response.json({ mode: "operational_incremental", active: null, generation: null, runs: [] }, { status: 503 }); }
 }
 
-export async function POST() {
+export async function POST(request: Request) {
+  if (!authorized(request)) return Response.json({ status: "unauthorized" }, { status: 401 });
   try {
+    const input = await request.json().catch(() => ({})) as { generationId?: string };
     const d1 = await getRawDb();
-    const current = await state();
-    if (current.snapshot?.status !== "complete") return Response.json({ status: "waiting_for_snapshot", error: "每日增量必須等Snapshot完整驗證與匯入完成。" }, { status: 409 });
+    const current = await state(d1, input.generationId);
+    const generation = current.generation;
+    if (!generation || !(["shadow", "ready", "active"] as string[]).includes(generation.status)) {
+      return Response.json({ status: "waiting_for_operational_generation", error: "尚無可更新的 operational generation。" }, { status: 409 });
+    }
+    if (input.generationId && generation.generationId !== input.generationId) throw new Error("Requested generation does not exist");
     const targetDate = latestCompletedMarketDate();
-    const anchor = current.lastCompletedDate && current.lastCompletedDate > current.snapshot.cutoffDate
-      ? current.lastCompletedDate : current.snapshot.cutoffDate;
+    const anchor = current.lastCompletedDate ?? generation.baseLastDate;
     const tradingDate = nextWeekday(anchor);
     if (tradingDate > targetDate) {
-      return Response.json({ status: "caught_up", throughDate: anchor, targetDate });
+      if (current.active?.activeGeneration === generation.generationId) {
+        const now = new Date().toISOString();
+        await d1.prepare("UPDATE operational_state SET latest_completed_date=?,freshness_status='fresh',last_incremental_at=?,updated_at=? WHERE id=1 AND active_generation=?")
+          .bind(anchor, now, now, generation.generationId).run();
+      }
+      return Response.json({ status: "caught_up", generationId: generation.generationId, throughDate: anchor, targetDate });
     }
-    const fetched = await Promise.all(markets.map(async (market) => {
+
+    const marketResults = await Promise.all(markets.map(async (market) => {
       try {
         const result = await fetchHistoricalMarketDay(market, tradingDate);
         const audit = auditBiasGuards(result.observations, tradingDate);
         if (audit.survivorship.status !== "pass" || audit.lookAhead.status !== "pass") throw new Error("Bias validation blocked incremental data");
-        return { market, rows: result.observations, error: null };
-      } catch (error) { return { market, rows: [] as HistoricalObservation[], error: error instanceof Error ? error.message : "Unknown error" }; }
+        return { market, rows: result.observations, checksum: await sha256(JSON.stringify(result.observations)), error: null as string | null };
+      } catch (error) {
+        return { market, rows: [] as HistoricalObservation[], checksum: null, error: error instanceof Error ? error.message : "Unknown error" };
+      }
     }));
-    const nonEmptyMarkets = fetched.filter((unit) => unit.rows.length > 0).length;
-    if (nonEmptyMarkets === 1) {
-      const empty = fetched.find((unit) => unit.rows.length === 0 && !unit.error);
-      if (empty) empty.error = "同日另一市場有資料，但本市場為空；保留checkpoint並等待官方資料完整。";
+    const nonEmpty = marketResults.filter((unit) => unit.rows.length > 0).length;
+    if (nonEmpty === 1) {
+      const empty = marketResults.find((unit) => unit.rows.length === 0 && !unit.error);
+      if (empty) empty.error = "同日另一市場有資料，但本市場為空；等待兩市場資料完整。";
     }
+
     const now = new Date().toISOString();
     const statements: D1PreparedStatement[] = [];
-    for (const unit of fetched) {
-      for (const payload of payloads(unit.rows)) statements.push(observationUpsert(d1,payload,now));
-      statements.push(d1.prepare(`INSERT INTO daily_incremental_runs (market,trading_date,status,rows_written,attempts,last_error,updated_at)
-        VALUES (?,?,?,?,1,?,?) ON CONFLICT(market,trading_date) DO UPDATE SET status=excluded.status,rows_written=excluded.rows_written,
-          attempts=daily_incremental_runs.attempts+1,last_error=excluded.last_error,updated_at=excluded.updated_at`)
-        .bind(unit.market,tradingDate,unit.error ? "failed" : unit.rows.length ? "complete" : "empty",unit.error ? 0 : unit.rows.length,unit.error?.slice(0,500) ?? null,now));
+    for (const unit of marketResults) {
+      for (const payload of payloads(unit.rows)) {
+        statements.push(barUpsert(d1, generation.generationId, payload, now));
+        statements.push(quoteUpsert(d1, generation.generationId, payload, now));
+        statements.push(securityUpsert(d1, generation.generationId, payload));
+      }
+      const stored = unit.rows.filter((row) => row.securityType === "ordinary_equity_candidate").length;
+      statements.push(d1.prepare(`INSERT INTO operational_ingestion_units
+        (generation_id,market,trading_date,status,rows_fetched,rows_stored,source_checksum,attempts,last_error,updated_at)
+        VALUES (?,?,?,?,?,?,?,1,?,?) ON CONFLICT(generation_id,market,trading_date) DO UPDATE SET
+        status=excluded.status,rows_fetched=excluded.rows_fetched,rows_stored=excluded.rows_stored,
+        source_checksum=excluded.source_checksum,attempts=operational_ingestion_units.attempts+1,
+        last_error=excluded.last_error,updated_at=excluded.updated_at`)
+        .bind(generation.generationId, unit.market, tradingDate,
+          unit.error ? "failed" : unit.rows.length ? "complete" : "validated_empty",
+          unit.error ? 0 : unit.rows.length, unit.error ? 0 : stored, unit.checksum,
+          unit.error?.slice(0, 500) ?? null, now));
     }
     await d1.batch(statements);
-    const hasGap = fetched.some((unit) => unit.error);
-    return Response.json({ status: hasGap ? "complete_with_gaps" : tradingDate < targetDate ? "continue" : "caught_up", tradingDate, targetDate, rowsWritten: fetched.reduce((sum, unit) => sum + unit.rows.length, 0), markets: fetched.map((unit) => ({ market: unit.market, rowsWritten: unit.rows.length, error: unit.error })) }, { status: hasGap ? 503 : tradingDate < targetDate ? 202 : 200 });
+    const hasGap = marketResults.some((unit) => unit.error);
+    if (hasGap) {
+      return Response.json({ status: "retry_required", generationId: generation.generationId, tradingDate, targetDate,
+        markets: marketResults.map((unit) => ({ market: unit.market, rowsFetched: unit.rows.length, error: unit.error })) }, { status: 503 });
+    }
+
+    const cutoff = await d1.prepare(`SELECT min(trading_date) AS cutoff FROM (
+      SELECT DISTINCT trading_date FROM operational_daily_bars WHERE generation_id=? ORDER BY trading_date DESC LIMIT ?
+    )`).bind(generation.generationId, generation.retentionTradingDays).first<{ cutoff: string | null }>();
+    if (cutoff?.cutoff) await d1.prepare("DELETE FROM operational_daily_bars WHERE generation_id=? AND trading_date<?").bind(generation.generationId, cutoff.cutoff).run();
+
+    try {
+      const pulse = await fetchMarketPulse();
+      if (pulse.tradingDate) {
+        await d1.prepare(`INSERT INTO operational_market_indices
+          (generation_id,index_code,index_name,trading_date,close,change,change_percent,source,fetched_at)
+          VALUES (?,'TAIEX',?,?,?,?,?,?,?) ON CONFLICT(generation_id,index_code) DO UPDATE SET index_name=excluded.index_name,
+          trading_date=excluded.trading_date,close=excluded.close,change=excluded.change,change_percent=excluded.change_percent,
+          source=excluded.source,fetched_at=excluded.fetched_at WHERE excluded.trading_date>=operational_market_indices.trading_date`)
+          .bind(generation.generationId, pulse.indexName, pulse.tradingDate, pulse.close, pulse.change, pulse.changePercent, pulse.sourceUrl, pulse.fetchedAt).run();
+      }
+    } catch { /* Stock data remains valid; index freshness is independent. */ }
+
+    const status = tradingDate < targetDate ? "continue" : "caught_up";
+    if (current.active?.activeGeneration === generation.generationId) {
+      await d1.prepare(`UPDATE operational_state SET latest_completed_date=?,freshness_status=?,last_incremental_at=?,updated_at=?
+        WHERE id=1 AND active_generation=?`).bind(tradingDate, freshnessStatus(tradingDate, targetDate), now, now, generation.generationId).run();
+    }
+    return Response.json({ status, generationId: generation.generationId, tradingDate, targetDate,
+      rowsFetched: marketResults.reduce((sum, unit) => sum + unit.rows.length, 0),
+      barsStored: marketResults.reduce((sum, unit) => sum + unit.rows.filter((row) => row.securityType === "ordinary_equity_candidate").length, 0),
+      markets: marketResults.map((unit) => ({ market: unit.market, rowsFetched: unit.rows.length })) }, { status: status === "continue" ? 202 : 200 });
   } catch (error) {
     return Response.json({ status: "error", error: error instanceof Error ? error.message : "Unknown incremental error" }, { status: 503 });
   }

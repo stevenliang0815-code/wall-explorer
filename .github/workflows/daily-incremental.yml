@@ -26,6 +26,5 @@ jobs:
           node-version: "22.13.0"
           cache: npm
       - run: npm ci
-      - name: Update both official markets after Snapshot import
+      - name: Idempotently update both official markets in the active operational generation
         run: npm run incremental:run
-

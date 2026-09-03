@@ -19,11 +19,11 @@ test("terminal jobs become scheduler no-ops", async () => {
   assert.match(route, /\["complete", "blocked_bias_violation"\]\.includes\(existingJob\.status\)/);
 });
 
-test("UI uses snapshot-first mode and does not auto-start browser backfill", async () => {
+test("UI reads the operational generation and exposes no Historical Backfill trigger", async () => {
   const page = await readFile("app/page.tsx", "utf8");
-  assert.match(page, /Snapshot優先/);
-  assert.match(page, /不再由瀏覽器自動啟動/);
-  assert.equal(page.match(/fetch\("\/api\/backfill"/g)?.length, 1, "only the explicit manual rebuild action may call backfill");
+  assert.match(page, /Generation shadow import＋原子切換/);
+  assert.match(page, /active operational generation/);
+  assert.doesNotMatch(page, /fetch\("\/api\/backfill"/);
 });
 
 test("migration enables automation without resetting backfill data", async () => {
@@ -222,12 +222,12 @@ test("daily GitHub Action updates both markets through the server API", async ()
   assert.match(workflow, /npm run incremental:run/);
 });
 
-test("PWA cloud job endpoint exposes status and GitHub start or retry controls", async () => {
+test("legacy cloud job endpoint remains compatible but is no longer exposed by the Web App", async () => {
   const route = await readFile("app/api/cloud-job/route.ts", "utf8");
   const page = await readFile("app/page.tsx", "utf8");
   assert.match(route, /HISTORICAL_JOB_STATUS_URL/);
   assert.match(route, /historical-backfill\.yml/);
-  assert.match(page, /GitHub Actions 雲端 Snapshot Job/);
+  assert.doesNotMatch(page, /GitHub Actions 雲端 Snapshot Job/);
 });
 
 test("daily incremental has an external server runner", async () => {

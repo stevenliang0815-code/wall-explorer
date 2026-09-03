@@ -252,3 +252,127 @@ export const watchlist = sqliteTable("watchlist", {
   market: text("market").notNull(),
   createdAt: text("created_at").notNull(),
 }, (table) => [uniqueIndex("watchlist_owner_stock_uq").on(table.ownerKey, table.market, table.code)]);
+
+export const operationalGenerations = sqliteTable("operational_generations", {
+  generationId: text("generation_id").primaryKey(),
+  snapshotVersion: text("snapshot_version").notNull(),
+  sourceSha256: text("source_sha256").notNull(),
+  baseLastDate: text("base_last_date").notNull(),
+  status: text("status").notNull().default("shadow"),
+  retentionTradingDays: integer("retention_trading_days").notNull(),
+  expectedBars: integer("expected_bars").notNull(),
+  expectedQuotes: integer("expected_quotes").notNull(),
+  expectedChunks: integer("expected_chunks").notNull(),
+  importedBars: integer("imported_bars").notNull().default(0),
+  importedQuotes: integer("imported_quotes").notNull().default(0),
+  importedChunks: integer("imported_chunks").notNull().default(0),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+  activatedAt: text("activated_at"),
+  lastError: text("last_error"),
+}, (table) => [index("operational_generation_status_idx").on(table.status, table.updatedAt)]);
+
+export const operationalState = sqliteTable("operational_state", {
+  id: integer("id").primaryKey(),
+  activeGeneration: text("active_generation"),
+  retentionTradingDays: integer("retention_trading_days").notNull().default(300),
+  policyVersion: text("policy_version").notNull(),
+  strategyMaxLookback: integer("strategy_max_lookback").notNull(),
+  forecastMaxHorizon: integer("forecast_max_horizon").notNull(),
+  safetyBufferDays: integer("safety_buffer_days").notNull(),
+  latestCompletedDate: text("latest_completed_date"),
+  freshnessStatus: text("freshness_status").notNull().default("rebuilding"),
+  lastIncrementalAt: text("last_incremental_at"),
+  updatedAt: text("updated_at").notNull(),
+});
+
+export const operationalSecurities = sqliteTable("operational_securities", {
+  generationId: text("generation_id").notNull(),
+  market: text("market").notNull(),
+  code: text("code").notNull(),
+  name: text("name").notNull(),
+  securityType: text("security_type").notNull(),
+  firstSeen: text("first_seen").notNull(),
+  lastSeen: text("last_seen").notNull(),
+}, (table) => [
+  uniqueIndex("operational_security_generation_market_code_uq").on(table.generationId, table.market, table.code),
+  index("operational_security_search_idx").on(table.generationId, table.code, table.name),
+]);
+
+export const operationalDailyBars = sqliteTable("operational_daily_bars", {
+  generationId: text("generation_id").notNull(),
+  market: text("market").notNull(),
+  code: text("code").notNull(),
+  tradingDate: text("trading_date").notNull(),
+  open: real("open"),
+  high: real("high"),
+  low: real("low"),
+  close: real("close"),
+  change: real("change"),
+  volume: integer("volume"),
+  tradeValue: real("trade_value"),
+  source: text("source").notNull(),
+  ingestedAt: text("ingested_at").notNull(),
+}, (table) => [
+  uniqueIndex("operational_bar_generation_market_code_date_uq").on(table.generationId, table.market, table.code, table.tradingDate),
+  index("operational_bar_generation_date_idx").on(table.generationId, table.tradingDate),
+  index("operational_bar_generation_code_date_idx").on(table.generationId, table.market, table.code, table.tradingDate),
+]);
+
+export const operationalLatestQuotes = sqliteTable("operational_latest_quotes", {
+  generationId: text("generation_id").notNull(),
+  market: text("market").notNull(),
+  code: text("code").notNull(),
+  name: text("name").notNull(),
+  securityType: text("security_type").notNull(),
+  tradingDate: text("trading_date").notNull(),
+  open: real("open"),
+  high: real("high"),
+  low: real("low"),
+  close: real("close"),
+  change: real("change"),
+  volume: integer("volume"),
+  tradeValue: real("trade_value"),
+  source: text("source").notNull(),
+  ingestedAt: text("ingested_at").notNull(),
+}, (table) => [
+  uniqueIndex("operational_quote_generation_market_code_uq").on(table.generationId, table.market, table.code),
+  index("operational_quote_generation_code_name_idx").on(table.generationId, table.code, table.name),
+]);
+
+export const operationalMarketIndices = sqliteTable("operational_market_indices", {
+  generationId: text("generation_id").notNull(),
+  indexCode: text("index_code").notNull(),
+  indexName: text("index_name").notNull(),
+  tradingDate: text("trading_date").notNull(),
+  close: real("close"),
+  change: real("change"),
+  changePercent: real("change_percent"),
+  source: text("source").notNull(),
+  fetchedAt: text("fetched_at").notNull(),
+}, (table) => [uniqueIndex("operational_index_generation_code_uq").on(table.generationId, table.indexCode)]);
+
+export const operationalIngestionUnits = sqliteTable("operational_ingestion_units", {
+  generationId: text("generation_id").notNull(),
+  market: text("market").notNull(),
+  tradingDate: text("trading_date").notNull(),
+  status: text("status").notNull(),
+  rowsFetched: integer("rows_fetched").notNull().default(0),
+  rowsStored: integer("rows_stored").notNull().default(0),
+  sourceChecksum: text("source_checksum"),
+  attempts: integer("attempts").notNull().default(1),
+  lastError: text("last_error"),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  uniqueIndex("operational_unit_generation_market_date_uq").on(table.generationId, table.market, table.tradingDate),
+  index("operational_unit_generation_status_idx").on(table.generationId, table.status, table.tradingDate),
+]);
+
+export const operationalImportChunks = sqliteTable("operational_import_chunks", {
+  generationId: text("generation_id").notNull(),
+  chunkIndex: integer("chunk_index").notNull(),
+  sha256: text("sha256").notNull(),
+  barsWritten: integer("bars_written").notNull(),
+  quotesWritten: integer("quotes_written").notNull(),
+  importedAt: text("imported_at").notNull(),
+}, (table) => [uniqueIndex("operational_chunk_generation_index_uq").on(table.generationId, table.chunkIndex)]);

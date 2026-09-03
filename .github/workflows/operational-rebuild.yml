@@ -1,0 +1,69 @@
+name: Rebuild Operational Database From Historical Snapshot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wall-explorer-operational-rebuild
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+      WALL_EXPLORER_URL: ${{ vars.WALL_EXPLORER_URL }}
+      OAI_SITES_AUTHORIZATION: ${{ secrets.OAI_SITES_AUTHORIZATION }}
+      OPERATIONAL_SQLITE_PATH: /tmp/wall-explorer-historical.sqlite
+      OPERATIONAL_POINTER_PATH: /tmp/historical-snapshot-pointer.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.13.0"
+          cache: npm
+      - run: npm ci
+      - name: Validate required configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET WALL_EXPLORER_URL OAI_SITES_AUTHORIZATION; do
+            if [ -z "${!key:-}" ]; then echo "Required configuration is missing: $key" >&2; exit 1; fi
+          done
+      - name: Download and verify the immutable Historical Snapshot
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          AWS_PAGER: ""
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check awscli
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws --endpoint-url "$endpoint" s3 cp --only-show-errors "s3://${R2_BUCKET}/snapshots/historical/latest.json" "$OPERATIONAL_POINTER_PATH"
+          readarray -t identity < <(python3 - "$OPERATIONAL_POINTER_PATH" <<'PY'
+          import json,re,sys
+          p=json.load(open(sys.argv[1])); key=p.get("objectKey","")
+          if p.get("status")!="verified" or p.get("progress")!=100 or p.get("compression")!="gzip-9-n": raise SystemExit("Snapshot pointer is not verified/final")
+          if not re.fullmatch(r"snapshots/historical/versions/builder-[a-f0-9]{64}\.sqlite\.gz",key): raise SystemExit("Snapshot key is not immutable")
+          print(key); print(p["rawSha256"])
+          PY
+          )
+          key="${identity[0]}" raw_sha="${identity[1]}"
+          aws --endpoint-url "$endpoint" s3 cp --only-show-errors "s3://${R2_BUCKET}/${key}" - | gzip -dc > "$OPERATIONAL_SQLITE_PATH"
+          test "$(sha256sum "$OPERATIONAL_SQLITE_PATH" | awk '{print $1}')" = "$raw_sha"
+      - name: Build shadow generation, catch up, and atomically activate
+        run: node --experimental-strip-types scripts/import-operational-generation.mjs
+      - name: Remove runner-local full snapshot
+        if: always()
+        shell: bash
+        run: rm -f -- "$OPERATIONAL_SQLITE_PATH" "$OPERATIONAL_POINTER_PATH"
