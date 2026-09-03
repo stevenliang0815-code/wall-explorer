@@ -1,0 +1,19 @@
+name: Backfill 38 Recovery (Decommissioned)
+
+# Kept as a harmless dispatch target so an already-running legacy batch cannot
+# restart the old scan -> abort -> dispatch loop after this reaches main.
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  decommissioned:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Legacy recovery is no longer a Backfill gate
+        run: |
+          echo "The Backfill #38 batch recovery chain is decommissioned."
+          echo "Legacy multipart cleanup now runs independently and never dispatches Backfill, Promotion, or Finalize."

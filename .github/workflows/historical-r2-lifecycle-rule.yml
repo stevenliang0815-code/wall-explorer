@@ -1,0 +1,38 @@
+name: Historical R2 Multipart Lifecycle Rule
+
+"on":
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/historical-r2-lifecycle-rule.yml"
+      - "scripts/r2-historical-lifecycle-rule.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wall-explorer-historical-r2-lifecycle-rule
+  cancel-in-progress: false
+
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+      R2_HISTORICAL_MULTIPART_ABORT_DAYS: "2"
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install R2 client
+        run: python3 -m pip install --disable-pip-version-check awscli
+      - name: Preserve existing rules and install the historical-prefix safety net
+        run: |
+          set -euo pipefail
+          bash -n scripts/r2-historical-common.sh scripts/r2-historical-lifecycle-rule.sh
+          bash scripts/r2-historical-lifecycle-rule.sh apply | tee -a "$GITHUB_STEP_SUMMARY"

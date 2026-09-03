@@ -1,0 +1,129 @@
+name: R2 Capacity Watchdog
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/r2-capacity-watchdog.yml"
+      - "scripts/r2-snapshot-store.sh"
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: wall-explorer-r2-capacity-watchdog
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+      R2_STORAGE_LIMIT_BYTES: "25000000000"
+      AWS_MAX_ATTEMPTS: "3"
+      AWS_RETRY_MODE: standard
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate required configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
+            if [ -z "${!key:-}" ]; then
+              echo "Required GitHub secret is missing: $key" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install S3-compatible client
+        run: python3 -m pip install --disable-pip-version-check awscli
+
+      - name: Measure completed objects and multipart parts
+        id: usage
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          usage_json=$(bash scripts/r2-checkpoint-lifecycle.sh usage-json)
+          read -r object_bytes multipart_bytes multipart_uploads usage_bytes < <(
+            python3 - "$usage_json" <<'PY'
+          import json, sys
+          u = json.loads(sys.argv[1])
+          print(u["objectBytes"], u["multipartBytes"], u["multipartUploads"], u["totalBytes"])
+          PY
+          )
+          echo "object_bytes=$object_bytes" >> "$GITHUB_OUTPUT"
+          echo "multipart_bytes=$multipart_bytes" >> "$GITHUB_OUTPUT"
+          echo "multipart_uploads=$multipart_uploads" >> "$GITHUB_OUTPUT"
+          echo "usage_bytes=$usage_bytes" >> "$GITHUB_OUTPUT"
+          if [ "$usage_bytes" -ge "$R2_STORAGE_LIMIT_BYTES" ]; then
+            echo "over_limit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "over_limit=false" >> "$GITHUB_OUTPUT"
+          fi
+          python3 - "$object_bytes" "$multipart_bytes" "$multipart_uploads" "$usage_bytes" "$R2_STORAGE_LIMIT_BYTES" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import sys
+          objects, multipart, uploads, usage, limit = map(int, sys.argv[1:])
+          print("## R2 capacity watchdog")
+          print()
+          print(f"- Completed objects: **{objects:,} bytes**")
+          print(f"- Unfinished multipart parts: **{multipart:,} bytes** across **{uploads}** upload(s)")
+          print(f"- Total measured usage: **{usage:,} bytes** ({usage / 1_000_000_000:.6f} GB)")
+          print(f"- Hard stop: **{limit:,} bytes** ({limit / 1_000_000_000:.2f} GB)")
+          print(f"- Remaining below hard stop: **{max(0, limit - usage):,} bytes**")
+          PY
+
+      - name: Record the capacity stop state
+        if: steps.usage.outputs.over_limit == 'true'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          AWS_PAGER: ""
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          printf '{"status":"stopped_capacity_limit","usageBytes":%s,"limitBytes":%s,"checkedAt":"%s"}\n' \
+            "${{ steps.usage.outputs.usage_bytes }}" \
+            "$R2_STORAGE_LIMIT_BYTES" \
+            "$(date -u +%FT%TZ)" > /tmp/capacity-stop.json
+          aws --endpoint-url "$endpoint" s3 cp \
+            /tmp/capacity-stop.json \
+            "s3://${R2_BUCKET}/jobs/historical/capacity-stop.json" \
+            --content-type application/json \
+            --cache-control no-store \
+            --only-show-errors
+
+      - name: Stop historical jobs only when measured usage is unsafe
+        if: steps.usage.outputs.over_limit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --workflow historical-backfill.yml \
+            --limit 100 \
+            --json databaseId,status \
+            --jq '.[] | select(.status == "in_progress" or .status == "queued") | .databaseId' \
+            | while read -r run_id; do
+                [ -n "$run_id" ] || continue
+                echo "Cancelling historical workflow run $run_id"
+                gh run cancel "$run_id" --repo "${GITHUB_REPOSITORY}"
+              done
+
+      - name: Warn when usage cannot be measured
+        if: steps.usage.outcome == 'failure'
+        run: |
+          echo "::warning::R2 usage could not be measured. The watchdog did not cancel or mutate a historical job; each large writer still has its own fail-closed preflight."

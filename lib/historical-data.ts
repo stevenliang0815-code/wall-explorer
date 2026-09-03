@@ -46,6 +46,30 @@ export type FetchProfile = {
   attempts: number;
 };
 
+export type HistoricalUnitFailureCategory = "transient" | "parsing" | "schema" | "integrity" | "source_rejected";
+
+export class HistoricalUnitError extends Error {
+  readonly category: HistoricalUnitFailureCategory;
+  readonly retryable: boolean;
+
+  constructor(category: HistoricalUnitFailureCategory, message: string, options: { cause?: unknown } = {}) {
+    super(message, options);
+    this.name = "HistoricalUnitError";
+    this.category = category;
+    this.retryable = category === "transient";
+  }
+}
+
+export function classifyHistoricalUnitError(error: unknown) {
+  if (error instanceof HistoricalUnitError) return error;
+  if (error instanceof SyntaxError) return new HistoricalUnitError("parsing", `Official JSON parsing failed: ${error.message}`, { cause: error });
+  const value = error instanceof Error ? error : new Error(String(error ?? "Unknown error"));
+  if (value.name === "AbortError" || value.name === "TimeoutError" || value instanceof TypeError || /(?:network|fetch failed|socket|ECONN|ETIMEDOUT|EAI_AGAIN)/i.test(value.message)) {
+    return new HistoricalUnitError("transient", value.message, { cause: value });
+  }
+  return new HistoricalUnitError("integrity", value.message, { cause: value });
+}
+
 export const BACKFILL_POLICY = Object.freeze({
   version: "pit-v2.2-bulk",
   targetStart: "2010-01-04",
@@ -245,19 +269,29 @@ export function auditBiasGuards(observations: HistoricalObservation[], tradingDa
 }
 
 const hostNextRequestAt = new Map<string, number>();
-const FETCH_POLICY = Object.freeze({ twseTimeoutMs: 10_000, tpexTimeoutMs: 20_000, maxAttempts: 3, hostSpacingMs: 350, backoffBaseMs: 400 });
+const FETCH_POLICY = Object.freeze({ twseTimeoutMs: 10_000, tpexTimeoutMs: 20_000, maxAttempts: 6, hostSpacingMs: 350, backoffBaseMs: 1_000, maxBackoffMs: 30_000 });
+
+type FetchHistoricalOptions = {
+  fetchImpl?: typeof fetch;
+  delayImpl?: (ms: number) => Promise<void>;
+  random?: () => number;
+  maxAttempts?: number;
+  hostSpacingMs?: number;
+  backoffBaseMs?: number;
+  maxBackoffMs?: number;
+};
 
 function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForHostSlot(source: string) {
+async function waitForHostSlot(source: string, spacingMs: number, delayImpl: (ms: number) => Promise<void>) {
   const host = new URL(source).host;
   const now = Date.now();
   const reservedAt = Math.max(now, hostNextRequestAt.get(host) ?? now);
-  hostNextRequestAt.set(host, reservedAt + FETCH_POLICY.hostSpacingMs);
+  hostNextRequestAt.set(host, reservedAt + spacingMs);
   const waitMs = Math.max(0, reservedAt - now);
-  if (waitMs) await delay(waitMs);
+  if (waitMs) await delayImpl(waitMs);
   return waitMs;
 }
 
@@ -265,23 +299,82 @@ function retryableStatus(status: number) {
   return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
-export async function fetchHistoricalMarketDay(market: HistoricalMarket, tradingDate: string) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(tradingDate)) throw new Error("Invalid trading date");
+const OFFICIAL_EMPTY_STATUS = /(?:沒有符合條件|查無資料|無交易資料|無資料|休市|尚無資料|no\s*data)/i;
+const OFFICIAL_TRANSIENT_STATUS = /(?:系統忙碌|稍後再試|暫時無法|逾時|busy|temporar|timeout)/i;
+
+function tableHasHistoricalSchema(table: OfficialTable) {
+  const fields = (table.fields ?? []).map(cleanLabel);
+  return findField(fields, FIELD_ALIASES.code) >= 0 && findField(fields, FIELD_ALIASES.name) >= 0 && findField(fields, FIELD_ALIASES.close) >= 0;
+}
+
+function interpretOfficialPayload(report: OfficialReport & LegacyTpexReport, market: HistoricalMarket, tradingDate: string, source: string) {
+  const officialStatus = cleanText(report.stat);
+  const officialDate = normalizeOfficialDate(report.date ?? report.reportDate);
+  if (officialDate && officialDate !== tradingDate) {
+    throw new HistoricalUnitError("schema", `Official date mismatch: requested ${tradingDate}, received ${officialDate}`);
+  }
+  if (OFFICIAL_TRANSIENT_STATUS.test(officialStatus)) {
+    throw new HistoricalUnitError("transient", `Official source is temporarily unavailable: ${officialStatus}`);
+  }
+  const officialEmpty = OFFICIAL_EMPTY_STATUS.test(officialStatus);
+  if (officialStatus && officialStatus.toUpperCase() !== "OK" && !officialEmpty) {
+    throw new HistoricalUnitError("schema", `Unrecognized official status: ${officialStatus}`);
+  }
+
+  if (Array.isArray(report.tables)) {
+    const matching = report.tables.filter(tableHasHistoricalSchema);
+    if (!matching.length) {
+      if (officialEmpty || report.tables.length === 0) {
+        return { observations: [] as HistoricalObservation[], unitStatus: "validated_empty" as const, emptyReason: officialEmpty ? officialStatus : "official-empty-tables", officialStatus, officialDate: officialDate ?? tradingDate };
+      }
+      throw new HistoricalUnitError("schema", "Official payload has tables but no recognizable full-market price table");
+    }
+    const observations = parseHistoricalReport({ ...report, tables: matching }, market, tradingDate, source);
+    const rawRows = matching.reduce((sum, table) => sum + (Array.isArray(table.data) ? table.data.length : 0), 0);
+    if (!observations.length && rawRows > 0) throw new HistoricalUnitError("schema", "Official full-market table contains rows but none can be parsed");
+    if (!observations.length) {
+      return { observations, unitStatus: "validated_empty" as const, emptyReason: officialEmpty ? officialStatus : "official-empty-market-table", officialStatus, officialDate: officialDate ?? tradingDate };
+    }
+    return { observations, unitStatus: "completed" as const, emptyReason: null, officialStatus, officialDate: officialDate ?? tradingDate };
+  }
+
+  if (source.includes("stk_quote_result.php") && Array.isArray(report.aaData)) {
+    const observations = parseLegacyTpexReport(report, tradingDate, source);
+    if (!observations.length && report.aaData.length > 0) throw new HistoricalUnitError("schema", "Official TPEx fallback contains rows but none can be parsed");
+    return observations.length
+      ? { observations, unitStatus: "completed" as const, emptyReason: null, officialStatus, officialDate: officialDate ?? tradingDate }
+      : { observations, unitStatus: "validated_empty" as const, emptyReason: officialEmpty ? officialStatus : "official-empty-aaData", officialStatus, officialDate: officialDate ?? tradingDate };
+  }
+
+  if (officialEmpty) {
+    return { observations: [] as HistoricalObservation[], unitStatus: "validated_empty" as const, emptyReason: officialStatus, officialStatus, officialDate: officialDate ?? tradingDate };
+  }
+  throw new HistoricalUnitError("schema", "Official payload schema is missing tables/aaData");
+}
+
+export async function fetchHistoricalMarketDay(market: HistoricalMarket, tradingDate: string, options: FetchHistoricalOptions = {}) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(tradingDate)) throw new HistoricalUnitError("schema", "Invalid trading date");
   const profile: FetchProfile = { networkMs: 0, parseMs: 0, retryCount: 0, throttledMs: 0, rateLimited: false, attempts: 0 };
   const sources = historicalSourceUrls(market, tradingDate);
-  let lastError: Error | null = null;
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const delayImpl = options.delayImpl ?? delay;
+  const random = options.random ?? Math.random;
+  const maxAttempts = Math.max(1, options.maxAttempts ?? FETCH_POLICY.maxAttempts);
+  const hostSpacingMs = Math.max(0, options.hostSpacingMs ?? FETCH_POLICY.hostSpacingMs);
+  const backoffBaseMs = Math.max(0, options.backoffBaseMs ?? FETCH_POLICY.backoffBaseMs);
+  const maxBackoffMs = Math.max(backoffBaseMs, options.maxBackoffMs ?? FETCH_POLICY.maxBackoffMs);
+  let lastError: HistoricalUnitError | null = null;
 
   for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex += 1) {
     const source = sources[sourceIndex];
-    const attempts = source.includes("/www/zh-tw/afterTrading/dailyQuotes") ? 1 : FETCH_POLICY.maxAttempts;
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       profile.attempts += 1;
-      const throttled = await waitForHostSlot(source);
+      const throttled = await waitForHostSlot(source, hostSpacingMs, delayImpl);
       profile.throttledMs += throttled;
       const networkStarted = performance.now();
       let networkRecorded = false;
       try {
-        const response = await fetch(source, {
+        const response = await fetchImpl(source, {
           headers: {
             Accept: "application/json",
             "User-Agent": "WallExplorerV2/2.2-bulk",
@@ -297,43 +390,34 @@ export async function fetchHistoricalMarketDay(market: HistoricalMarket, trading
         profile.networkMs += performance.now() - networkStarted;
         networkRecorded = true;
         if (!response.ok) {
-          const error = new Error(`Official historical source returned ${response.status}`);
-          if (!retryableStatus(response.status)) throw error;
+          const category = retryableStatus(response.status) ? "transient" : "source_rejected";
           if (response.status === 429) profile.rateLimited = true;
-          throw error;
+          throw new HistoricalUnitError(category, `Official historical source returned ${response.status}`);
         }
 
         const parseStarted = performance.now();
-        const report = JSON.parse(body) as OfficialReport & LegacyTpexReport;
-        const observations = Array.isArray(report.tables)
-          ? parseHistoricalReport(report, market, tradingDate, source)
-          : source.includes("stk_quote_result.php")
-            ? parseLegacyTpexReport(report, tradingDate, source)
-            : parseHistoricalReport(report, market, tradingDate, source);
-        profile.parseMs += performance.now() - parseStarted;
-        const officialDate = normalizeOfficialDate(report.date ?? report.reportDate);
-        if (observations.length && officialDate && officialDate !== tradingDate) {
-          throw new Error(`Official date mismatch: requested ${tradingDate}, received ${officialDate}`);
+        let report: OfficialReport & LegacyTpexReport;
+        try {
+          report = JSON.parse(body) as OfficialReport & LegacyTpexReport;
+        } catch (error) {
+          throw new HistoricalUnitError("parsing", `Official JSON parsing failed: ${error instanceof Error ? error.message : "invalid JSON"}`, { cause: error });
         }
-        return {
-          source,
-          observations,
-          officialStatus: report.stat ?? null,
-          officialDate: officialDate ?? tradingDate,
-          profile,
-        };
+        const interpreted = interpretOfficialPayload(report, market, tradingDate, source);
+        profile.parseMs += performance.now() - parseStarted;
+        return { source, ...interpreted, profile };
       } catch (error) {
         if (!networkRecorded) profile.networkMs += performance.now() - networkStarted;
-        lastError = error instanceof Error ? error : new Error("Unknown official source error");
-        const isLast = attempt + 1 >= attempts;
+        lastError = classifyHistoricalUnitError(error);
+        if (!lastError.retryable) throw Object.assign(lastError, { fetchProfile: profile });
+        const isLast = attempt + 1 >= maxAttempts;
         if (isLast) break;
         profile.retryCount += 1;
-        const backoff = FETCH_POLICY.backoffBaseMs * 2 ** attempt + Math.floor(Math.random() * 150);
+        const backoff = Math.min(maxBackoffMs, backoffBaseMs * 2 ** attempt) + Math.floor(random() * 150);
         profile.throttledMs += backoff;
-        await delay(backoff);
+        await delayImpl(backoff);
       }
     }
     if (sourceIndex + 1 < sources.length) profile.retryCount += 1;
   }
-  throw Object.assign(lastError ?? new Error("Official historical source unavailable"), { fetchProfile: profile });
+  throw Object.assign(new HistoricalUnitError("transient", `Official historical source remained unavailable after ${profile.attempts} attempts: ${lastError?.message ?? "unknown error"}`, { cause: lastError }), { fetchProfile: profile });
 }

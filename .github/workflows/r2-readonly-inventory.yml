@@ -1,0 +1,187 @@
+name: R2 Read-only Inventory
+
+"on":
+  push:
+    paths:
+      - ".github/workflows/r2-readonly-inventory.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wall-explorer-r2-readonly-inventory
+  cancel-in-progress: false
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+      AWS_DEFAULT_REGION: auto
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_PAGER: ""
+
+    steps:
+      - name: Validate secret names without printing values
+        shell: bash
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
+            if [ -z "${!key:-}" ]; then
+              echo "Required GitHub secret is missing: $key" >&2
+              exit 1
+            fi
+          done
+          echo "Required connection values are present."
+
+      - name: Install S3-compatible client
+        run: python3 -m pip install --disable-pip-version-check awscli
+
+      - name: List objects and incomplete multipart parts
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+          aws --endpoint-url "$endpoint" s3api list-objects-v2             --bucket "$R2_BUCKET"             --output json > /tmp/r2-objects.json
+
+          aws --endpoint-url "$endpoint" s3api list-multipart-uploads             --bucket "$R2_BUCKET"             --output json > /tmp/r2-uploads.json
+
+          : > /tmp/r2-multipart-summary.ndjson
+          python3 - <<'PY' > /tmp/r2-upload-pairs.bin
+          import json, sys
+          data = json.load(open("/tmp/r2-uploads.json", encoding="utf-8"))
+          for upload in data.get("Uploads", []):
+              sys.stdout.buffer.write(upload["Key"].encode("utf-8") + b"\0")
+              sys.stdout.buffer.write(upload["UploadId"].encode("utf-8") + b"\0")
+          PY
+
+          index=0
+          while IFS= read -r -d '' object_key && IFS= read -r -d '' upload_id; do
+            parts_file="/tmp/r2-parts-${index}.json"
+            aws --endpoint-url "$endpoint" s3api list-parts               --bucket "$R2_BUCKET"               --key "$object_key"               --upload-id "$upload_id"               --output json > "$parts_file"
+            python3 - "$object_key" "$parts_file" >> /tmp/r2-multipart-summary.ndjson <<'PY'
+          import json, sys
+          key, path = sys.argv[1:]
+          data = json.load(open(path, encoding="utf-8"))
+          parts = data.get("Parts", [])
+          print(json.dumps({
+              "key": key,
+              "partCount": len(parts),
+              "bytes": sum(int(part.get("Size", 0)) for part in parts),
+          }, ensure_ascii=False))
+          PY
+            index=$((index + 1))
+          done < /tmp/r2-upload-pairs.bin
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          objects_data = json.load(open("/tmp/r2-objects.json", encoding="utf-8"))
+          def purpose(key):
+              if key == "checkpoints/historical/builder.sqlite":
+                  return "legacy canonical raw SQLite"
+              if key.startswith("checkpoints/historical/candidates/") and key.endswith("/builder.sqlite"):
+                  return "retained legacy candidate raw SQLite"
+              if key.startswith("checkpoints/historical/versions/") and key.endswith(".sqlite"):
+                  return "immutable versioned raw SQLite"
+              if key.startswith("snapshots/historical/versions/") and key.endswith(".sqlite.gz"):
+                  return "immutable verified compressed Snapshot"
+              if key == "checkpoints/historical/latest.json":
+                  return "small canonical checkpoint pointer"
+              if key == "snapshots/historical/latest.json":
+                  return "small published Snapshot pointer"
+              if key == "jobs/historical/stop.json":
+                  return "durable pause / stop marker"
+              if key == "jobs/historical/state.json":
+                  return "durable lifecycle state machine"
+              if key == "jobs/historical/lease.json":
+                  return "durable single-writer lease"
+              if key in ("jobs/historical/pending-checkpoint.json", "jobs/historical/pending-snapshot.json"):
+                  return "idempotent pending operation descriptor"
+              if key.startswith("jobs/historical/uploads/"):
+                  return "multipart upload ID and completed-parts state"
+              if key.endswith(".sha256"):
+                  return "checksum metadata"
+              if key.endswith("status.json"):
+                  return "checkpoint or job status metadata"
+              if key.endswith("manifest.json") or key.startswith("manifests/"):
+                  return "snapshot manifest metadata"
+              if key.startswith("legacy-checkpoints/"):
+                  return "legacy D1 recovery checkpoint"
+              return "supporting object"
+
+          objects = sorted(
+              [{
+                  "key": item["Key"],
+                  "bytes": int(item["Size"]),
+                  "etag": item.get("ETag"),
+                  "lastModified": item.get("LastModified"),
+                  "purpose": purpose(item["Key"]),
+              } for item in objects_data.get("Contents", [])],
+              key=lambda item: item["key"],
+          )
+
+          multipart_path = Path("/tmp/r2-multipart-summary.ndjson")
+          multipart = [
+              json.loads(line)
+              for line in multipart_path.read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+
+          object_bytes = sum(item["bytes"] for item in objects)
+          multipart_bytes = sum(item["bytes"] for item in multipart)
+          estimated_total_bytes = object_bytes + multipart_bytes
+
+          report = {
+              "status": "read_only_inventory_complete",
+              "objectCount": len(objects),
+              "objectBytes": object_bytes,
+              "objectGB": round(object_bytes / 1_000_000_000, 6),
+              "objectGiB": round(object_bytes / 1024**3, 6),
+              "incompleteMultipartUploadCount": len(multipart),
+              "incompleteMultipartBytes": multipart_bytes,
+              "estimatedTotalStorageBytes": estimated_total_bytes,
+              "estimatedTotalStorageGB": round(estimated_total_bytes / 1_000_000_000, 6),
+              "estimatedTotalStorageGiB": round(estimated_total_bytes / 1024**3, 6),
+              "objects": objects,
+              "incompleteMultipartUploads": multipart,
+          }
+
+          print("R2_READONLY_INVENTORY=" + json.dumps(
+              report, ensure_ascii=False, separators=(",", ":")
+          ))
+
+          with open(Path.home() / "inventory-summary.md", "w", encoding="utf-8") as out:
+              out.write("## R2 read-only inventory\n\n")
+              out.write(f"- Objects: **{report['objectCount']}**\n")
+              out.write(f"- Object bytes: **{object_bytes}** ({report['objectGB']:.6f} GB / {report['objectGiB']:.6f} GiB)\n")
+              out.write(f"- Incomplete multipart uploads: **{len(multipart)}**\n")
+              out.write(f"- Incomplete multipart bytes: **{multipart_bytes}**\n")
+              out.write(f"- Estimated total storage: **{estimated_total_bytes} bytes** ({report['estimatedTotalStorageGB']:.6f} GB / {report['estimatedTotalStorageGiB']:.6f} GiB)\n\n")
+              out.write("| Object key | Bytes | ETag | Purpose | Last modified |\n")
+              out.write("|---|---:|---|---|---|\n")
+              for item in objects:
+                  key = item["key"].replace("|", "\\|")
+                  purpose_text = item["purpose"].replace("|", "\\|")
+                  etag = str(item.get("etag") or "").replace("|", "\\|")
+                  out.write(f"| \`{key}\` | {item['bytes']} | {etag} | {purpose_text} | {item.get('lastModified') or ''} |\n")
+              if multipart:
+                  out.write("\n### Incomplete multipart uploads\n\n")
+                  out.write("| Object key | Parts | Bytes |\n")
+                  out.write("|---|---:|---:|\n")
+                  for item in multipart:
+                      key = item["key"].replace("|", "\\|")
+                      out.write(f"| \`{key}\` | {item['partCount']} | {item['bytes']} |\n")
+          PY
+
+          cat "$HOME/inventory-summary.md" >> "$GITHUB_STEP_SUMMARY"

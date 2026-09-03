@@ -1,0 +1,55 @@
+name: R2 Compression Read-only Dry Run
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wall-explorer-r2-compression-dry-run
+  cancel-in-progress: false
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+      R2_STORAGE_LIMIT_BYTES: "25000000000"
+      R2_SAFETY_RESERVE_BYTES: "100000000"
+      SNAPSHOT_OUTPUT_ROOT: snapshot-output
+      SNAPSHOT_VERSION: 2026-08-17-v1
+
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m pip install --disable-pip-version-check awscli
+      - name: Resolve and restore the verified raw source without mutation
+        run: |
+          set -euo pipefail
+          resolved=$(bash scripts/r2-checkpoint-lifecycle.sh resolve)
+          printf '%s\n' "$resolved" > /tmp/resolved.json
+          bash scripts/r2-checkpoint-lifecycle.sh restore
+      - name: Validate raw and measure deterministic gzip
+        shell: bash
+        run: |
+          set -euo pipefail
+          db="snapshot-output/historical-2026-08-17.building/historical.sqlite"
+          test -f "$db"
+          expected_sha=$(node -e 'const d=require("/tmp/resolved.json");process.stdout.write(d.sha256)' 2>/dev/null || python3 -c 'import json;print(json.load(open("/tmp/resolved.json"))["sha256"])')
+          [ "$expected_sha" = "-" ] || test "$(sha256sum "$db" | awk '{print $1}')" = "$expected_sha"
+          test "$(python3 - "$db" <<'PY'
+          import sqlite3,sys
+          c=sqlite3.connect(f"file:{sys.argv[1]}?mode=ro",uri=True); print(c.execute("PRAGMA integrity_check").fetchone()[0]); c.close()
+          PY
+          )" = ok
+          gzip -9n -c "$db" > /tmp/builder.sqlite.gz
+          gzip -t /tmp/builder.sqlite.gz
+          test "$(gzip -dc /tmp/builder.sqlite.gz | sha256sum | awk '{print $1}')" = "$(sha256sum "$db" | awk '{print $1}')"
+          gzip_bytes=$(stat -c '%s' /tmp/builder.sqlite.gz)
+          bash scripts/r2-checkpoint-lifecycle.sh projected-peak "$gzip_bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Deterministic gzip bytes: $gzip_bytes" >> "$GITHUB_STEP_SUMMARY"
+          echo "No R2 object, pointer, multipart upload, lease, or state was mutated." >> "$GITHUB_STEP_SUMMARY"

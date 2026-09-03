@@ -1,0 +1,161 @@
+name: Verify legacy D1 checkpoint in R2
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/verify-r2-checkpoint.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wall-explorer-r2-checkpoint-verification
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      OBJECT_KEY: legacy-checkpoints/wall-explorer-legacy-d1-2025-12-28.ndjson.gz
+      EXPECTED_ROWS: "152052"
+      EXPECTED_CURSOR: "2025-12-28"
+
+    steps:
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
+            if [ -z "${!key:-}" ]; then
+              echo "Required GitHub secret is missing: $key" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install S3-compatible client
+        run: python3 -m pip install --disable-pip-version-check awscli
+
+      - name: Download checkpoint from R2
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3api head-object             --endpoint-url "$endpoint"             --bucket "$R2_BUCKET"             --key "$OBJECT_KEY"             > /tmp/r2-head.json
+          aws s3 cp             --only-show-errors             --endpoint-url "$endpoint"             "s3://${R2_BUCKET}/${OBJECT_KEY}"             /tmp/legacy-checkpoint.ndjson.gz
+
+      - name: Verify gzip, manifest, row counts, and checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          gzip -t /tmp/legacy-checkpoint.ndjson.gz
+          python3 - <<'PY'
+          import gzip
+          import hashlib
+          import json
+          import os
+          from collections import Counter
+          from pathlib import Path
+
+          path = Path("/tmp/legacy-checkpoint.ndjson.gz")
+          expected_rows = int(os.environ["EXPECTED_ROWS"])
+          expected_cursor = os.environ["EXPECTED_CURSOR"]
+          expected_format = "wall-explorer-legacy-d1-checkpoint-v1"
+
+          manifest = None
+          complete = None
+          counts = Counter()
+
+          with gzip.open(path, "rt", encoding="utf-8") as stream:
+              for line_number, raw_line in enumerate(stream, 1):
+                  record = json.loads(raw_line)
+                  record_type = record.get("type")
+                  if line_number == 1:
+                      if record_type != "manifest":
+                          raise SystemExit("First record is not the checkpoint manifest")
+                      manifest = record
+                  elif record_type == "row":
+                      counts[record["table"]] += 1
+                  elif record_type == "complete":
+                      complete = record
+                  else:
+                      raise SystemExit(f"Unexpected record type on line {line_number}: {record_type!r}")
+
+          if not manifest or manifest.get("format") != expected_format:
+              raise SystemExit("Checkpoint manifest format is invalid")
+          if not complete or complete.get("format") != expected_format:
+              raise SystemExit("Checkpoint completion footer is missing")
+          if dict(counts) != manifest.get("tableCounts"):
+              raise SystemExit(f"Manifest counts differ from exported rows: {dict(counts)}")
+          if dict(counts) != complete.get("exportedCounts"):
+              raise SystemExit(f"Completion counts differ from exported rows: {dict(counts)}")
+
+          checkpoint = manifest.get("checkpoint") or {}
+          if checkpoint.get("cursorDate") != expected_cursor:
+              raise SystemExit(f"Unexpected cursorDate: {checkpoint.get('cursorDate')!r}")
+          if int(checkpoint.get("storedRows", -1)) != expected_rows:
+              raise SystemExit(f"Unexpected storedRows: {checkpoint.get('storedRows')!r}")
+          if counts["historical_observations"] < expected_rows:
+              raise SystemExit(
+                  f"Expected at least {expected_rows} historical observations, found {counts['historical_observations']}"
+              )
+
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          report = {
+              "status": "verified",
+              "sha256": digest,
+              "compressedBytes": path.stat().st_size,
+              "cursorDate": checkpoint["cursorDate"],
+              "checkpointStoredRows": int(checkpoint["storedRows"]),
+              "historicalObservations": counts["historical_observations"],
+              "additionalObservations": counts["historical_observations"] - expected_rows,
+              "tableCounts": dict(counts),
+          }
+          Path("/tmp/legacy-validation.json").write_text(
+              json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          Path("/tmp/legacy-checkpoint.sha256").write_text(
+              f"{digest}  {os.environ['OBJECT_KEY']}\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(report, ensure_ascii=False))
+          PY
+
+      - name: Store checksum beside the verified checkpoint
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp             --only-show-errors             --content-type text/plain             --endpoint-url "$endpoint"             /tmp/legacy-checkpoint.sha256             "s3://${R2_BUCKET}/${OBJECT_KEY}.sha256"
+
+      - name: Publish verification summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f /tmp/legacy-validation.json ]; then
+            {
+              echo "## R2 legacy checkpoint verified"
+              echo
+              echo "- Object: \`${OBJECT_KEY}\`"
+              echo "- Expected cursor: \`${EXPECTED_CURSOR}\`"
+              echo "- Expected observations: \`${EXPECTED_ROWS}\`"
+              echo
+              echo "\`\`\`json"
+              cat /tmp/legacy-validation.json
+              echo "\`\`\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

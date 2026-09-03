@@ -25,6 +25,8 @@ export type HistoricalSnapshotManifest = {
   markets: Record<"上市" | "上櫃", { rows: number; dates: number }>;
   sqlite: { path: string; bytes: number; sha256: string; encoding: "gzip" };
   chunks: SnapshotChunk[];
+  mergeStrategy?: "upsert";
+  continuation?: null | { source: "sites-d1"; cursorDate: string; storedRows: number; processedUnits: number };
   validation: {
     status: "pass" | "blocked";
     openFailures: number;
@@ -52,6 +54,7 @@ export function validateSnapshotManifest(value: unknown): HistoricalSnapshotMani
     throw new Error("Snapshot market coverage is incomplete");
   }
   if (!Array.isArray(manifest.chunks) || !manifest.chunks.length) throw new Error("Snapshot has no import chunks");
+  if (manifest.mergeStrategy && manifest.mergeStrategy !== "upsert") throw new Error("Snapshot merge strategy is unsupported");
   if (manifest.validation?.status !== "pass" || manifest.validation.openFailures !== 0 || manifest.validation.duplicates !== 0 || manifest.validation.survivorshipViolations !== 0 || manifest.validation.lookAheadViolations !== 0) {
     throw new Error("Snapshot validation gate did not pass");
   }

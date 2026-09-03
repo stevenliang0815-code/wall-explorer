@@ -1,0 +1,45 @@
+name: Historical Legacy Multipart Garbage Collection
+
+"on":
+  workflow_dispatch: {}
+  workflow_run:
+    workflows: ["Historical Multipart Private Classification"]
+    types: [completed]
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wall-explorer-historical-legacy-multipart-gc
+  cancel-in-progress: false
+
+jobs:
+  gc:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+      R2_TRANSIENT_MAX_ATTEMPTS: "8"
+      R2_LEGACY_ABORT_CONCURRENCY: "8"
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install R2 client
+        run: python3 -m pip install --disable-pip-version-check awscli
+      - name: Validate independent Legacy GC
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do test -n "${!key:-}"; done
+          bash -n scripts/r2-historical-common.sh scripts/r2-legacy-multipart-gc.sh
+          node --test tests/r2-legacy-multipart-gc.test.mjs
+      - name: Full paginated Legacy Multipart GC
+        run: |
+          set -euo pipefail
+          bash scripts/r2-legacy-multipart-gc.sh gc | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "latest.json, Historical lifecycle state, Backfill, Promotion, and Finalize were not modified or dispatched." >> "$GITHUB_STEP_SUMMARY"

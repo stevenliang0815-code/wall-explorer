@@ -1,0 +1,46 @@
+name: Historical Multipart Private Classification
+
+"on":
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/historical-backfill38-recovery.yml"
+      - ".github/workflows/historical-multipart-classification.yml"
+      - "scripts/r2-legacy-multipart-gc.sh"
+      - "scripts/r2-historical-common.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wall-explorer-historical-multipart-classification
+  cancel-in-progress: false
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+      R2_TRANSIENT_MAX_ATTEMPTS: "8"
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install R2 client
+        run: python3 -m pip install --disable-pip-version-check awscli
+      - name: Validate classifier
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do test -n "${!key:-}"; done
+          bash -n scripts/r2-historical-common.sh scripts/r2-legacy-multipart-gc.sh
+          node --test tests/r2-legacy-multipart-gc.test.mjs
+      - name: Full paginated private classification
+        run: |
+          set -euo pipefail
+          bash scripts/r2-legacy-multipart-gc.sh classify
+          echo "Classification completed; counts stayed inside the private R2 control prefix." >> "$GITHUB_STEP_SUMMARY"
+          echo "No multipart upload, checkpoint object, latest.json, lifecycle state, lease, or workflow was mutated." >> "$GITHUB_STEP_SUMMARY"

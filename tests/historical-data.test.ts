@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { auditBiasGuards, BACKFILL_POLICY, historicalSourceUrls, parseHistoricalReport, parseLegacyTpexReport } from "../lib/historical-data.ts";
+import {
+  auditBiasGuards,
+  BACKFILL_POLICY,
+  fetchHistoricalMarketDay,
+  historicalSourceUrls,
+  HistoricalUnitError,
+  parseHistoricalReport,
+  parseLegacyTpexReport,
+} from "../lib/historical-data.ts";
 
 test("point-in-time parser retains securities without consulting today's listing directory", () => {
   const report = {
@@ -51,4 +59,76 @@ test("legacy TPEx full-market fallback keeps delisted candidates and point-in-ti
   const sources = historicalSourceUrls("上櫃", "2020-01-02");
   assert.match(sources[0], /\/www\/zh-tw\/afterTrading\/dailyQuotes/);
   assert.match(sources[1], /daily_close_quotes\/stk_quote_result\.php/);
+});
+
+test("transient 429/5xx responses use exponential backoff and then continue", async () => {
+  const responses = [
+    new Response("rate limited", { status: 429 }),
+    new Response("busy", { status: 503 }),
+    new Response(JSON.stringify({ stat: "OK", date: "20250417", tables: [{
+      fields: ["證券代號", "證券名稱", "收盤價"],
+      data: [["1101", "台泥", "40"]],
+    }] }), { status: 200 }),
+  ];
+  const delays: number[] = [];
+  let calls = 0;
+  const result = await fetchHistoricalMarketDay("上市", "2025-04-17", {
+    fetchImpl: async () => responses[calls++],
+    delayImpl: async (ms) => { delays.push(ms); },
+    random: () => 0,
+    hostSpacingMs: 0,
+    backoffBaseMs: 10,
+    maxBackoffMs: 100,
+  });
+  assert.equal(calls, 3);
+  assert.deepEqual(delays, [10, 20]);
+  assert.equal(result.profile.retryCount, 2);
+  assert.equal(result.profile.rateLimited, true);
+  assert.equal(result.unitStatus, "completed");
+  assert.equal(result.observations.length, 1);
+});
+
+test("official confirmed no-data becomes a validated empty unit", async () => {
+  const result = await fetchHistoricalMarketDay("上市", "2025-04-17", {
+    fetchImpl: async () => new Response(JSON.stringify({ stat: "很抱歉，沒有符合條件的資料!", date: "20250417" }), { status: 200 }),
+    delayImpl: async () => {},
+    hostSpacingMs: 0,
+  });
+  assert.equal(result.unitStatus, "validated_empty");
+  assert.equal(result.observations.length, 0);
+  assert.match(result.emptyReason, /沒有符合條件/);
+});
+
+test("parsing and schema failures hard-stop without retry or fallback", async () => {
+  for (const body of ["<html>not json</html>", JSON.stringify({ stat: "OK", tables: [{ fields: ["unexpected"], data: [["x"]] }] })]) {
+    let calls = 0;
+    const delays: number[] = [];
+    await assert.rejects(
+      fetchHistoricalMarketDay("上櫃", "2025-04-17", {
+        fetchImpl: async () => { calls += 1; return new Response(body, { status: 200 }); },
+        delayImpl: async (ms) => { delays.push(ms); },
+        hostSpacingMs: 0,
+      }),
+      (error) => error instanceof HistoricalUnitError && !error.retryable && ["parsing", "schema"].includes(error.category),
+    );
+    assert.equal(calls, 1);
+    assert.deepEqual(delays, []);
+  }
+});
+
+test("an exhausted network hole remains classified transient after bounded retries", async () => {
+  let calls = 0;
+  await assert.rejects(
+    fetchHistoricalMarketDay("上市", "2025-04-17", {
+      fetchImpl: async () => { calls += 1; throw new TypeError("fetch failed: ETIMEDOUT"); },
+      delayImpl: async () => {},
+      random: () => 0,
+      maxAttempts: 3,
+      hostSpacingMs: 0,
+      backoffBaseMs: 0,
+      maxBackoffMs: 0,
+    }),
+    (error) => error instanceof HistoricalUnitError && error.category === "transient" && /after 3 attempts/.test(error.message),
+  );
+  assert.equal(calls, 3);
 });

@@ -43,6 +43,13 @@
       "when": 1787238375922,
       "tag": "0005_nosy_cable",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1788420638745,
+      "tag": "0006_military_firedrake",
+      "breakpoints": true
     }
   ]
 }

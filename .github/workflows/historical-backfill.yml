@@ -1,0 +1,117 @@
+name: Historical Snapshot Backfill
+
+"on":
+  workflow_dispatch:
+    inputs:
+      batch_dates:
+        description: Dates processed per in-run batch
+        required: false
+        default: "2"
+      max_cycles:
+        description: Optional canary limit; 0 runs until checkpoint cadence is due
+        required: false
+        default: "0"
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: wall-explorer-historical-snapshot
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+      R2_STORAGE_LIMIT_BYTES: "25000000000"
+      R2_SAFETY_RESERVE_BYTES: "100000000"
+      SNAPSHOT_OUTPUT_ROOT: snapshot-output
+      SNAPSHOT_VERSION: 2026-08-17-v1
+      BATCH_DATES: ${{ inputs.batch_dates || '2' }}
+      MAX_CYCLES: ${{ inputs.max_cycles || '0' }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install builder and R2 clients
+        run: |
+          bash scripts/install-ci.sh
+          python3 -m pip install --disable-pip-version-check awscli
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do test -n "${!key:-}"; done
+          bash -n scripts/r2-historical-common.sh
+          bash -n scripts/r2-checkpoint-lifecycle.sh
+      - name: Keep durable pause authoritative
+        id: pause
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" AWS_DEFAULT_REGION=auto AWS_EC2_METADATA_DISABLED=true AWS_PAGER=""
+          if aws --endpoint-url "$endpoint" s3api head-object --bucket "$R2_BUCKET" --key jobs/historical/stop.json >/dev/null 2>&1; then
+            echo "stopped=true" >> "$GITHUB_OUTPUT"
+            echo "Historical backfill remains paused; no runner or upload started." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "stopped=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Acquire durable lifecycle lease
+        if: steps.pause.outputs.stopped != 'true'
+        run: bash scripts/r2-checkpoint-lifecycle.sh acquire-lease "backfill-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" backfill
+      - name: Restore only the current verified checkpoint
+        if: steps.pause.outputs.stopped != 'true'
+        run: bash scripts/r2-checkpoint-lifecycle.sh restore
+      - name: Backfill in-run until checkpoint cadence is due
+        if: steps.pause.outputs.stopped != 'true'
+        id: builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          cycles=0
+          due=false
+          baseline="snapshot-output/restored-status.json"
+          [ -f "$baseline" ] || baseline="-"
+          while [ "$due" != true ]; do
+            cycles=$((cycles + 1))
+            node --experimental-strip-types scripts/build-historical-snapshot.mjs \
+              --start 2010-01-04 --end 2025-12-28 --snapshot-cutoff 2026-08-17 \
+              --continuation-cursor 2025-12-28 --continuation-rows 152052 --continuation-units 464 \
+              --total-units 12140 --workers 2 --max-dates "$BATCH_DATES" --output "$SNAPSHOT_OUTPUT_ROOT"
+            decision=$(node scripts/historical-lifecycle.mjs checkpoint-due snapshot-output/job-status.json "$baseline")
+            due=$(node -e 'const d=JSON.parse(process.argv[1]);process.stdout.write(String(d.due))' "$decision")
+            reason=$(node -e 'const d=JSON.parse(process.argv[1]);process.stdout.write(d.reason)' "$decision")
+            echo "Checkpoint cadence: due=$due reason=$reason cycle=$cycles"
+            if [ "$MAX_CYCLES" -gt 0 ] && [ "$cycles" -ge "$MAX_CYCLES" ] && [ "$due" != true ]; then
+              echo "Canary ended before checkpoint cadence; no large R2 upload was created." >> "$GITHUB_STEP_SUMMARY"
+              break
+            fi
+          done
+          echo "checkpoint_due=$due" >> "$GITHUB_OUTPUT"
+      - name: Upload one immutable pending checkpoint
+        if: steps.pause.outputs.stopped != 'true' && steps.builder.outputs.checkpoint_due == 'true'
+        run: bash scripts/r2-checkpoint-lifecycle.sh upload
+      - name: Release durable lifecycle lease
+        if: always() && steps.pause.outputs.stopped != 'true'
+        run: bash scripts/r2-checkpoint-lifecycle.sh release-lease "backfill-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: Explicitly dispatch checkpoint promotion
+        if: success() && steps.pause.outputs.stopped != 'true' && steps.builder.outputs.checkpoint_due == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run historical-checkpoint-promotion.yml --repo "$GITHUB_REPOSITORY" --ref main
+      - name: Record failure without moving the canonical pointer
+        if: failure()
+        run: |
+          set -euo pipefail
+          source scripts/r2-historical-common.sh
+          if object_exists "$stop_key"; then
+            echo "Preserved the uploader's durable stop after explicit abort handling."
+          else
+            bash scripts/r2-checkpoint-lifecycle.sh record-stop "Backfill/checkpoint upload failed in run ${GITHUB_RUN_ID}; the last verified canonical was retained."
+          fi
