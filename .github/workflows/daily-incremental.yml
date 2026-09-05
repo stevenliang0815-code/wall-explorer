@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: wall-explorer-daily-incremental
@@ -15,10 +16,11 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     env:
       WALL_EXPLORER_URL: ${{ vars.WALL_EXPLORER_URL }}
       OAI_SITES_AUTHORIZATION: ${{ secrets.OAI_SITES_AUTHORIZATION }}
+      INCREMENTAL_BATCH_DATES: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -26,5 +28,11 @@ jobs:
           node-version: "22.13.0"
           cache: npm
       - run: npm ci
-      - name: Idempotently update both official markets in the active operational generation
+      - name: Update one bounded, resumable batch for both official markets
+        id: incremental
         run: npm run incremental:run
+      - name: Continue with the next batch
+        if: steps.incremental.outputs.continue == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run daily-incremental.yml --ref main

@@ -276,6 +276,7 @@ type FetchHistoricalOptions = {
   delayImpl?: (ms: number) => Promise<void>;
   random?: () => number;
   maxAttempts?: number;
+  timeoutMs?: number;
   hostSpacingMs?: number;
   backoffBaseMs?: number;
   maxBackoffMs?: number;
@@ -360,6 +361,7 @@ export async function fetchHistoricalMarketDay(market: HistoricalMarket, trading
   const delayImpl = options.delayImpl ?? delay;
   const random = options.random ?? Math.random;
   const maxAttempts = Math.max(1, options.maxAttempts ?? FETCH_POLICY.maxAttempts);
+  const timeoutMs = Math.max(1, options.timeoutMs ?? (market === "上櫃" ? FETCH_POLICY.tpexTimeoutMs : FETCH_POLICY.twseTimeoutMs));
   const hostSpacingMs = Math.max(0, options.hostSpacingMs ?? FETCH_POLICY.hostSpacingMs);
   const backoffBaseMs = Math.max(0, options.backoffBaseMs ?? FETCH_POLICY.backoffBaseMs);
   const maxBackoffMs = Math.max(backoffBaseMs, options.maxBackoffMs ?? FETCH_POLICY.maxBackoffMs);
@@ -382,7 +384,7 @@ export async function fetchHistoricalMarketDay(market: HistoricalMarket, trading
               ? "https://www.twse.com.tw/zh/trading/historical/mi-index.html"
               : "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html",
           },
-          signal: AbortSignal.timeout(source.includes("tpex.org.tw") ? FETCH_POLICY.tpexTimeoutMs : FETCH_POLICY.twseTimeoutMs),
+          signal: AbortSignal.timeout(timeoutMs),
           cache: "no-store",
           redirect: "follow",
         });
