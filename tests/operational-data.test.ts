@@ -67,10 +67,16 @@ test("latest-quote planning avoids the former correlated full-table query", () =
 test("daily APIs read the active operational generation after bootstrap", async () => {
   const reader = await readFile("lib/operational-read.ts", "utf8");
   const candidates = await readFile("app/api/candidates/route.ts", "utf8");
+  const market = await readFile("app/api/market/route.ts", "utf8");
+  const stocks = await readFile("app/api/stocks/route.ts", "utf8");
   const incremental = await readFile("app/api/incremental/route.ts", "utf8");
   assert.match(reader, /FROM operational_latest_quotes/);
   assert.match(reader, /FROM operational_market_indices/);
   assert.match(candidates, /dataMode: "operational_db"/);
+  for (const route of [candidates, market, stocks]) {
+    assert.match(route, /operational_unavailable/);
+    assert.doesNotMatch(route, /bootstrap.fallback|fetchOfficialStocks|fetchMarketPulse|searchOfficialStocks/i);
+  }
   assert.match(incremental, /operational_ingestion_units/);
   assert.match(incremental, /attempts=operational_ingestion_units\.attempts\+1/);
   assert.match(incremental, /savedByMarket/);
@@ -83,6 +89,20 @@ test("daily APIs read the active operational generation after bootstrap", async 
   assert.match(incremental, /target = 1_500_000/);
   assert.match(incremental, /DELETE FROM operational_daily_bars/);
   assert.doesNotMatch(incremental, /historical_observations/);
+});
+
+test("production acceptance exposes exact retention and guarded atomic rollback", async () => {
+  const health = await readFile("app/api/model-health/route.ts", "utf8");
+  const rebuild = await readFile("app/api/operational/rebuild/route.ts", "utf8");
+  const verifier = await readFile("scripts/verify-operational-rollback.mjs", "utf8");
+  assert.match(health, /count\(DISTINCT trading_date\) AS tradingDayCount/);
+  assert.match(rebuild, /dates\?\.count \?\? 0\) !== generation\.retentionTradingDays/);
+  assert.match(rebuild, /body\.action === "rollback"/);
+  assert.match(rebuild, /Rollback target must be a retired verified generation/);
+  assert.match(rebuild, /UPDATE operational_state SET active_generation=/);
+  assert.match(verifier, /Rollback row counts changed/);
+  assert.match(verifier, /Rollback checksum did not match/);
+  assert.match(verifier, /Web App did not recover/);
 });
 
 test("write APIs trust the private Sites dispatch boundary", async () => {

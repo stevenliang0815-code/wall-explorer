@@ -89,8 +89,8 @@ async function state(d1: D1Database, requestedGeneration?: string | null) {
     targetDate: latestCompletedMarketDate(), runs: runs.results };
 }
 
-export async function GET() {
-  try { return Response.json(await state(await getRawDb()), { headers: { "Cache-Control": "no-store" } }); }
+export async function GET(request: Request) {
+  try { return Response.json(await state(await getRawDb(), new URL(request.url).searchParams.get("generation")), { headers: { "Cache-Control": "no-store" } }); }
   catch { return Response.json({ mode: "operational_incremental", active: null, generation: null, runs: [] }, { status: 503 }); }
 }
 

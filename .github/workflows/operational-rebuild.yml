@@ -2,6 +2,16 @@ name: Rebuild Operational Database From Historical Snapshot
 
 on:
   workflow_dispatch:
+    inputs:
+      generation_id:
+        description: Stable generation ID used by resumable acceptance batches
+        required: false
+        default: ""
+      acceptance_drill:
+        description: Catch up, switch, inject a failure, and roll back
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -25,6 +35,9 @@ jobs:
       OPERATIONAL_MAX_SECONDS: "2400"
       OPERATIONAL_SQLITE_PATH: /tmp/wall-explorer-historical.sqlite
       OPERATIONAL_POINTER_PATH: /tmp/historical-snapshot-pointer.json
+      OPERATIONAL_GENERATION_ID: ${{ inputs.generation_id }}
+      OPERATIONAL_GENERATION_SUFFIX: ${{ inputs.acceptance_drill && github.run_id || '' }}
+      OPERATIONAL_AUTO_ACTIVATE: ${{ inputs.acceptance_drill && 'false' || 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -70,7 +83,28 @@ jobs:
         if: steps.operational.outputs.continue == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run operational-rebuild.yml --ref main
+          GENERATION_ID: ${{ steps.operational.outputs.generation_id }}
+          ACCEPTANCE_DRILL: ${{ inputs.acceptance_drill }}
+        run: gh workflow run operational-rebuild.yml --ref main -f generation_id="$GENERATION_ID" -f acceptance_drill="$ACCEPTANCE_DRILL"
+      - name: Catch up the verified shadow generation
+        id: incremental
+        if: inputs.acceptance_drill && steps.operational.outputs.continue != 'true'
+        env:
+          OPERATIONAL_GENERATION_ID: ${{ steps.operational.outputs.generation_id }}
+          INCREMENTAL_BATCH_DATES: 20
+          INCREMENTAL_DEFERRED_ATTEMPT: "0"
+        run: npm run incremental:run
+      - name: Dispatch the next bounded catch-up batch
+        if: inputs.acceptance_drill && steps.operational.outputs.continue != 'true' && steps.incremental.outputs.continue == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GENERATION_ID: ${{ steps.operational.outputs.generation_id }}
+        run: gh workflow run operational-rebuild.yml --ref main -f generation_id="$GENERATION_ID" -f acceptance_drill=true
+      - name: Verify atomic switch, injected failure, and rollback
+        if: inputs.acceptance_drill && steps.operational.outputs.continue != 'true' && steps.incremental.outputs.continue != 'true'
+        env:
+          OPERATIONAL_GENERATION_ID: ${{ steps.operational.outputs.generation_id }}
+        run: node scripts/verify-operational-rollback.mjs
       - name: Remove runner-local full snapshot
         if: always()
         shell: bash

@@ -28,8 +28,8 @@ export async function GET() {
         importedChunks: number; createdAt: string; updatedAt: string; activatedAt: string | null; lastError: string | null;
       }>() : null;
     const [bars, quotes, gaps, runs] = await Promise.all([
-      state?.generationId ? d1.prepare(`SELECT count(*) AS count,min(trading_date) AS earliestDate,max(trading_date) AS latestDate
-        FROM operational_daily_bars WHERE generation_id=?`).bind(state.generationId).first<{ count: number; earliestDate: string | null; latestDate: string | null }>() : null,
+      state?.generationId ? d1.prepare(`SELECT count(*) AS count,count(DISTINCT trading_date) AS tradingDayCount,min(trading_date) AS earliestDate,max(trading_date) AS latestDate
+        FROM operational_daily_bars WHERE generation_id=?`).bind(state.generationId).first<{ count: number; tradingDayCount: number; earliestDate: string | null; latestDate: string | null }>() : null,
       state?.generationId ? d1.prepare("SELECT count(*) AS count FROM operational_latest_quotes WHERE generation_id=?").bind(state.generationId).first<{ count: number }>() : null,
       state?.generationId ? d1.prepare("SELECT count(*) AS count FROM operational_ingestion_units WHERE generation_id=? AND status='failed'").bind(state.generationId).first<{ count: number }>() : null,
       db.select().from(modelRuns).orderBy(desc(modelRuns.createdAt)).limit(3),
@@ -40,6 +40,7 @@ export async function GET() {
       stockCount: quotes?.count ?? 0,
       earliestDate: bars?.earliestDate ?? null,
       latestDate: bars?.latestDate ?? null,
+      tradingDayCount: bars?.tradingDayCount ?? 0,
       modelRuns: runs,
       backfill: null,
       runner: null,
@@ -69,7 +70,7 @@ export async function GET() {
     }, { headers: { "Cache-Control": "no-store" } });
   } catch {
     return Response.json({
-      status: "not_initialized", historicalRows: 0, stockCount: 0, earliestDate: null, latestDate: null,
+      status: "not_initialized", historicalRows: 0, stockCount: 0, earliestDate: null, latestDate: null, tradingDayCount: 0,
       modelRuns: [], backfill: null, runner: null, snapshot: null,
       operational: { state: null, generation: null, missingOrFailedUnits: 0, policy: OPERATIONAL_RETENTION },
       performance: { recentRowsPerSecond: 0, averageRowsPerSecond: 0, activeRuntimeMs: 0, etaSeconds: null,

@@ -45,7 +45,7 @@ type ChunkRequest = {
   quotes: OperationalRow[];
 };
 
-type GenerationRequest = { action: "validate" | "activate" | "cleanup"; generationId: string; allowStaleBootstrap?: boolean };
+type GenerationRequest = { action: "validate" | "activate" | "rollback" | "cleanup"; generationId: string; allowStaleBootstrap?: boolean; failureReason?: string };
 
 function authorized(request: Request) {
   return request.headers.get("x-dispatched-app")?.startsWith("site---") ||
@@ -78,6 +78,17 @@ async function sha256(value: string) {
   const bytes = new TextEncoder().encode(value);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function generationMetrics(d1: D1Database, generationId: string) {
+  const [bars, quotes, dates] = await Promise.all([
+    d1.prepare("SELECT count(*) count,min(trading_date) earliestDate,max(trading_date) latestDate FROM operational_daily_bars WHERE generation_id=?")
+      .bind(generationId).first<{ count: number; earliestDate: string | null; latestDate: string | null }>(),
+    d1.prepare("SELECT count(*) count FROM operational_latest_quotes WHERE generation_id=?").bind(generationId).first<{ count: number }>(),
+    d1.prepare("SELECT count(DISTINCT trading_date) count FROM operational_daily_bars WHERE generation_id=?").bind(generationId).first<{ count: number }>(),
+  ]);
+  return { rowCount: bars?.count ?? 0, quoteCount: quotes?.count ?? 0, tradingDayCount: dates?.count ?? 0,
+    earliestDate: bars?.earliestDate ?? null, latestDate: bars?.latestDate ?? null };
 }
 
 function barsUpsert(d1: D1Database, generationId: string, payload: string, now: string) {
@@ -135,8 +146,9 @@ async function generationStatus(d1: D1Database, generationId?: string) {
     ORDER BY chunk_index DESC LIMIT 1`).bind(generationId).first<{ sourceKind: string | null; sourceLastId: number | null }>() : null;
   const resumeKind = generation && generation.importedBars < generation.expectedBars ? "bars" : "quotes";
   const resumeSourceId = lastChunk?.sourceKind === resumeKind ? Number(lastChunk.sourceLastId ?? 0) : 0;
+  const metrics = generationId && generation ? await generationMetrics(d1, generationId) : null;
   return { mode: "operational_generation", policy: OPERATIONAL_RETENTION, state,
-    generation: generation ? { ...generation, resumeKind, resumeSourceId } : null };
+    generation: generation ? { ...generation, resumeKind, resumeSourceId, metrics } : null };
 }
 
 export async function GET(request: Request) {
@@ -263,7 +275,7 @@ export async function POST(request: Request) {
         d1.prepare("SELECT count(DISTINCT trading_date) count FROM operational_daily_bars WHERE generation_id=?").bind(body.generationId).first<{ count: number }>(),
       ]);
       if (bars?.count !== generation.expectedBars || quotes?.count !== generation.expectedQuotes || chunks?.count !== generation.expectedChunks) throw new Error("Shadow generation row or chunk counts do not match the manifest");
-      if ((dates?.count ?? 0) > generation.retentionTradingDays) throw new Error("Shadow generation exceeds its retention policy");
+      if ((dates?.count ?? 0) !== generation.retentionTradingDays) throw new Error("Shadow generation does not contain the exact retention trading-day count");
       await d1.prepare("UPDATE operational_generations SET status='ready',updated_at=?,last_error=NULL WHERE generation_id=? AND status='shadow'").bind(now, body.generationId).run();
       return Response.json(await generationStatus(d1, body.generationId));
     }
@@ -296,6 +308,38 @@ export async function POST(request: Request) {
             OPERATIONAL_RETENTION.safetyBufferDays, throughDate, freshness, now, now),
       ]);
       return Response.json(await generationStatus(d1, body.generationId));
+    }
+
+    if (body.action === "rollback") {
+      if (generation.status !== "retired") throw new Error("Rollback target must be a retired verified generation");
+      const active = await d1.prepare(`SELECT s.active_generation AS generationId,g.source_sha256 AS sourceSha256
+        FROM operational_state s JOIN operational_generations g ON g.generation_id=s.active_generation WHERE s.id=1`)
+        .first<{ generationId: string | null; sourceSha256: string | null }>();
+      if (!active?.generationId || active.generationId === body.generationId) throw new Error("Rollback requires a different active generation");
+      const metrics = await generationMetrics(d1, body.generationId);
+      if (metrics.rowCount < 1 || metrics.quoteCount < 1 || metrics.tradingDayCount !== generation.retentionTradingDays || !metrics.latestDate) {
+        throw new Error("Rollback target failed row-count, latest-date, or retention verification");
+      }
+      const verified = await d1.prepare("SELECT source_sha256 AS sourceSha256 FROM operational_generations WHERE generation_id=?")
+        .bind(body.generationId).first<{ sourceSha256: string }>();
+      if (!verified || !/^[a-f0-9]{64}$/.test(verified.sourceSha256)) throw new Error("Rollback target checksum is invalid");
+      const freshness = freshnessStatus(metrics.latestDate, latestCompletedMarketDate());
+      const reason = body.failureReason?.slice(0, 500) || "Production acceptance injected failure";
+      await d1.batch([
+        d1.prepare("UPDATE operational_generations SET status='failed',last_error=?,updated_at=? WHERE generation_id=? AND status='active'")
+          .bind(reason, now, active.generationId),
+        d1.prepare("UPDATE operational_generations SET status='active',last_error=NULL,updated_at=? WHERE generation_id=? AND status='retired'")
+          .bind(now, body.generationId),
+        d1.prepare(`UPDATE operational_state SET active_generation=?,retention_trading_days=?,policy_version=?,
+          strategy_max_lookback=?,forecast_max_horizon=?,safety_buffer_days=?,latest_completed_date=?,freshness_status=?,
+          last_incremental_at=?,updated_at=? WHERE id=1 AND active_generation=?`)
+          .bind(body.generationId, generation.retentionTradingDays, OPERATIONAL_RETENTION.version,
+            OPERATIONAL_RETENTION.strategyMaxLookback, OPERATIONAL_RETENTION.forecastMaxHorizon,
+            OPERATIONAL_RETENTION.safetyBufferDays, metrics.latestDate, freshness, now, now, active.generationId),
+      ]);
+      return Response.json({ status: "rolled_back", failedGenerationId: active.generationId,
+        restoredGenerationId: body.generationId, restoredSourceSha256: verified.sourceSha256, metrics,
+        state: (await generationStatus(d1, body.generationId)).state });
     }
 
     if (body.action === "cleanup") {

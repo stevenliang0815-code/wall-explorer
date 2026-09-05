@@ -1,4 +1,3 @@
-import { searchOfficialStocks } from "../../../lib/official-data";
 import { operationalStockSearch } from "../../../lib/operational-read";
 
 export const dynamic = "force-dynamic";
@@ -8,7 +7,7 @@ export async function GET(request: Request) {
   try {
     const operational = await operationalStockSearch(query);
     if (operational) return Response.json(operational, { headers: { "Cache-Control": "public, max-age=120" } });
-    return Response.json({ stocks: await searchOfficialStocks(query), fetchedAt: new Date().toISOString() }, { headers: { "Cache-Control": "public, max-age=120", "X-Data-Mode": "bootstrap-fallback" } });
+    return Response.json({ status: "operational_unavailable", stocks: [], error: "Operational DB is not available" }, { status: 503 });
   }
-  catch { return Response.json({ stocks: [], fetchedAt: new Date().toISOString() }); }
+  catch { return Response.json({ status: "operational_unavailable", stocks: [], error: "Operational DB is not available" }, { status: 503 }); }
 }

@@ -25,7 +25,9 @@ function output(name, value) {
 
 let transientAttempts = 0;
 while (iterations < maxIterations) {
-  const stateResponse = await fetch(endpoint, {
+  const stateUrl = new URL(endpoint);
+  if (generationId) stateUrl.searchParams.set("generation", generationId);
+  const stateResponse = await fetch(stateUrl, {
     headers: { "OAI-Sites-Authorization": `Bearer ${token}` },
     signal: AbortSignal.timeout(15_000),
   });

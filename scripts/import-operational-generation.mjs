@@ -11,6 +11,7 @@ const sqlitePath = process.env.OPERATIONAL_SQLITE_PATH;
 const pointerPath = process.env.OPERATIONAL_POINTER_PATH;
 const chunkRows = Math.max(100, Math.min(1_500, Number(process.env.OPERATIONAL_CHUNK_ROWS ?? 900)));
 const maxSeconds = Math.max(60, Math.min(14_400, Number(process.env.OPERATIONAL_MAX_SECONDS ?? 2_400)));
+const autoActivate = process.env.OPERATIONAL_AUTO_ACTIVATE !== "false";
 const deadline = Date.now() + maxSeconds * 1_000;
 if (!baseUrl || !token || !sqlitePath || !pointerPath) throw new Error("Operational rebuild environment is incomplete");
 
@@ -55,8 +56,12 @@ const latestBindings = latestMarketDates.flatMap((row) => [row.market, row.tradi
 const expectedQuotes = Number(db.prepare(`SELECT count(*) value FROM historical_observations
   WHERE ${latestPredicates}`).get(...latestBindings).value);
 const totalChunks = Math.ceil(expectedBars / chunkRows) + Math.ceil(expectedQuotes / chunkRows);
-const generationId = `op-${pointer.rawSha256.slice(0, 24)}-${OPERATIONAL_RETENTION.version}`;
+const defaultGenerationId = `op-${pointer.rawSha256.slice(0, 24)}-${OPERATIONAL_RETENTION.version}`;
+const generationId = process.env.OPERATIONAL_GENERATION_ID || (process.env.OPERATIONAL_GENERATION_SUFFIX
+  ? `${defaultGenerationId}-${process.env.OPERATIONAL_GENERATION_SUFFIX}` : defaultGenerationId);
 const endpoint = new URL("/api/operational/rebuild", baseUrl);
+if (!/^[a-z0-9][a-z0-9._-]{7,127}$/i.test(generationId)) throw new Error("Operational generation ID is invalid");
+if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `generation_id=${generationId}\n`);
 log("snapshot_preflight_completed", { generationId, baseLastDate, cutoff, expectedBars, expectedQuotes, totalChunks, chunkRows });
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
@@ -131,6 +136,13 @@ if (status === "shadow") {
   await post(endpoint.pathname, { action: "validate", generationId });
   status = "ready";
   log("operational_generation_validated", { generationId, chunkIndex });
+}
+
+if (!autoActivate) {
+  log("operational_generation_ready", { generationId, baseLastDate, cutoff, expectedBars, expectedQuotes,
+    retentionTradingDays: OPERATIONAL_RETENTION.retentionTradingDays });
+  db.close();
+  process.exit(0);
 }
 
 const activated = await post(endpoint.pathname, { action: "activate", generationId, allowStaleBootstrap: true });
