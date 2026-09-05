@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { appendFileSync } from "node:fs";
-import { auditBiasGuards, fetchHistoricalMarketDay } from "../lib/historical-data.ts";
+import { auditBiasGuards, fetchHistoricalMarketDay, HistoricalUnitError } from "../lib/historical-data.ts";
 import { nextWeekday } from "../lib/operational-time.ts";
 
 const baseUrl = process.env.WALL_EXPLORER_URL;
@@ -16,6 +16,8 @@ const generationId = process.env.OPERATIONAL_GENERATION_ID;
 let iterations = 0;
 let rowsWritten = 0;
 const maxIterations = Math.max(1, Number(process.env.INCREMENTAL_BATCH_DATES ?? 20));
+const deferredAttempt = Math.max(0, Number(process.env.INCREMENTAL_DEFERRED_ATTEMPT ?? 0));
+const maxDeferredAttempts = 6;
 
 function output(name, value) {
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value}\n`);
@@ -37,7 +39,30 @@ while (iterations < maxIterations) {
   if (tradingDate <= state.targetDate) {
     for (const market of ["上市", "上櫃"]) {
       if (["complete", "validated_empty"].includes(saved.get(market)?.status)) continue;
-      const result = await fetchHistoricalMarketDay(market, tradingDate, { maxAttempts: 3, timeoutMs: 15_000 });
+      let result;
+      try {
+        result = await fetchHistoricalMarketDay(market, tradingDate, {
+          maxAttempts: 5,
+          timeoutMs: 15_000,
+          maxBackoffMs: 15_000,
+        });
+      } catch (error) {
+        if (error instanceof HistoricalUnitError && error.retryable && deferredAttempt < maxDeferredAttempts) {
+          output("continue", "true");
+          output("deferred_attempt", String(deferredAttempt + 1));
+          console.log(JSON.stringify({
+            status: "source_deferred",
+            market,
+            tradingDate,
+            deferredAttempt: deferredAttempt + 1,
+            reason: error.message,
+            rowsWritten,
+            iterations,
+          }));
+          process.exit(0);
+        }
+        throw error;
+      }
       const audit = auditBiasGuards(result.observations, tradingDate);
       if (audit.survivorship.status !== "pass" || audit.lookAhead.status !== "pass") {
         throw new Error(`Bias validation blocked ${market} ${tradingDate}`);
@@ -65,10 +90,13 @@ while (iterations < maxIterations) {
   iterations += 1;
   if (body.status === "caught_up") {
     output("continue", "false");
+    output("deferred_attempt", "0");
     console.log(JSON.stringify({ status: body.status, generationId: body.generationId, throughDate: body.tradingDate ?? body.throughDate, rowsWritten, iterations }));
     process.exit(0);
   }
 }
 
 output("continue", "true");
+output("deferred_attempt", "0");
 console.log(JSON.stringify({ status: "batch_complete", rowsWritten, iterations }));
+
