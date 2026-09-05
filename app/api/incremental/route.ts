@@ -7,7 +7,7 @@ export const dynamic = "force-dynamic";
 const markets: HistoricalMarket[] = ["上市", "上櫃"];
 
 function authorized(request: Request) {
-  return request.headers.get("OAI-Sites-Authorization")?.startsWith("Bearer ") || request.headers.get("x-wall-incremental-trigger") === "scheduled";
+  return request.headers.get("x-dispatched-app")?.startsWith("site---") || request.headers.get("x-wall-incremental-trigger") === "scheduled";
 }
 
 function payloads(rows: HistoricalObservation[], target = 600_000) {

@@ -77,6 +77,15 @@ test("daily APIs read the active operational generation after bootstrap", async 
   assert.doesNotMatch(incremental, /historical_observations/);
 });
 
+test("write APIs trust the private Sites dispatch boundary", async () => {
+  const rebuild = await readFile("app/api/operational/rebuild/route.ts", "utf8");
+  const incremental = await readFile("app/api/incremental/route.ts", "utf8");
+  assert.match(rebuild, /x-dispatched-app/);
+  assert.match(incremental, /x-dispatched-app/);
+  assert.doesNotMatch(rebuild, /OAI-Sites-Authorization/);
+  assert.doesNotMatch(incremental, /OAI-Sites-Authorization/);
+});
+
 test("operational rebuild is separate and never triggers Historical lifecycle", async () => {
   const workflow = await readFile(".github/workflows/operational-rebuild.yml", "utf8");
   const importer = await readFile("scripts/import-operational-generation.mjs", "utf8");

@@ -48,7 +48,7 @@ type ChunkRequest = {
 type GenerationRequest = { action: "validate" | "activate" | "cleanup"; generationId: string };
 
 function authorized(request: Request) {
-  return request.headers.get("OAI-Sites-Authorization")?.startsWith("Bearer ") ||
+  return request.headers.get("x-dispatched-app")?.startsWith("site---") ||
     request.headers.get("x-wall-operational-trigger") === "scheduled";
 }
 
