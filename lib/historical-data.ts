@@ -297,7 +297,7 @@ async function waitForHostSlot(source: string, spacingMs: number, delayImpl: (ms
 }
 
 function retryableStatus(status: number) {
-  return status === 408 || status === 425 || status === 429 || status >= 500;
+  return (status >= 300 && status < 400) || status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
 const OFFICIAL_EMPTY_STATUS = /(?:沒有符合條件|查無資料|無交易資料|無資料|休市|尚無資料|no\s*data)/i;
