@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { operationalRetentionPolicy, OPERATIONAL_RETENTION, STRATEGY_REQUIREMENTS } from "../lib/operational-policy.ts";
 import { freshnessStatus, latestCompletedMarketDate, nextWeekday } from "../lib/operational-time.ts";
@@ -37,6 +38,32 @@ test("operational migration is append-only and generation activation is atomic",
   assert.match(route, /INSERT INTO operational_state/);
 });
 
+test("operational import checkpoints persist immutable batch parameters and cursors", async () => {
+  const migration = await readFile("drizzle/0007_mute_steve_rogers.sql", "utf8");
+  const route = await readFile("app/api/operational/rebuild/route.ts", "utf8");
+  assert.match(migration, /ADD `chunk_rows` integer DEFAULT 900 NOT NULL/);
+  assert.match(migration, /ADD `source_kind` text/);
+  assert.match(migration, /ADD `source_last_id` integer/);
+  assert.doesNotMatch(migration, /DROP|DELETE|TRUNCATE/i);
+  assert.match(route, /different immutable import parameters/);
+  assert.match(route, /Operational chunks must be imported sequentially/);
+  assert.match(route, /source_kind,source_last_id/);
+  assert.match(route, /resumeKind, resumeSourceId/);
+});
+
+test("latest-quote planning avoids the former correlated full-table query", () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec(`CREATE TABLE historical_observations (id INTEGER PRIMARY KEY, market TEXT, trading_date TEXT);
+    CREATE INDEX historical_date_market_idx ON historical_observations(trading_date, market);`);
+  const formerPlan = db.prepare(`EXPLAIN QUERY PLAN SELECT count(*) FROM historical_observations h
+    WHERE trading_date=(SELECT max(trading_date) FROM historical_observations WHERE market=h.market)`).all();
+  const currentPlan = db.prepare(`EXPLAIN QUERY PLAN SELECT market,max(trading_date)
+    FROM historical_observations GROUP BY market`).all();
+  assert.match(formerPlan.map((row) => String(row.detail)).join("\n"), /CORRELATED SCALAR SUBQUERY/);
+  assert.doesNotMatch(currentPlan.map((row) => String(row.detail)).join("\n"), /CORRELATED/);
+  db.close();
+});
+
 test("daily APIs read the active operational generation after bootstrap", async () => {
   const reader = await readFile("lib/operational-read.ts", "utf8");
   const candidates = await readFile("app/api/candidates/route.ts", "utf8");
@@ -54,10 +81,17 @@ test("operational rebuild is separate and never triggers Historical lifecycle", 
   const workflow = await readFile(".github/workflows/operational-rebuild.yml", "utf8");
   const importer = await readFile("scripts/import-operational-generation.mjs", "utf8");
   assert.match(workflow, /snapshots\/historical\/latest\.json/);
-  assert.match(workflow, /push:\n\s+branches: \[main\]/);
+  assert.doesNotMatch(workflow, /push:\n/);
   assert.match(workflow, /Build shadow generation, catch up, and atomically activate/);
-  assert.doesNotMatch(workflow, /historical-backfill\.yml|historical-finalize\.yml|gh workflow run/);
+  assert.match(workflow, /steps\.operational\.outputs\.continue == 'true'/);
+  assert.match(workflow, /gh workflow run operational-rebuild\.yml --ref main/);
+  assert.doesNotMatch(workflow, /historical-backfill\.yml|historical-finalize\.yml/);
   assert.match(importer, /action: "validate"/);
   assert.match(importer, /action: "activate"/);
   assert.match(importer, /OPERATIONAL_RETENTION\.retentionTradingDays/);
+  assert.match(importer, /PRAGMA quick_check/);
+  assert.match(importer, /GROUP BY market/);
+  assert.doesNotMatch(importer, /WHERE market=h\.market/);
+  assert.match(importer, /resumeSourceId/);
+  assert.match(importer, /GITHUB_OUTPUT/);
 });

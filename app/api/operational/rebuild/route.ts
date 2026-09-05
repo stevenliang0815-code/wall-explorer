@@ -5,6 +5,7 @@ import { freshnessStatus, latestCompletedMarketDate } from "../../../../lib/oper
 export const dynamic = "force-dynamic";
 
 type OperationalRow = {
+  id: number;
   market: "上市" | "上櫃";
   code: string;
   name: string;
@@ -30,6 +31,7 @@ type StartRequest = {
   expectedBars: number;
   expectedQuotes: number;
   totalChunks: number;
+  chunkRows: number;
 };
 
 type ChunkRequest = {
@@ -37,6 +39,8 @@ type ChunkRequest = {
   generationId: string;
   chunkIndex: number;
   sha256: string;
+  kind: "bars" | "quotes";
+  sourceLastId: number;
   bars: OperationalRow[];
   quotes: OperationalRow[];
 };
@@ -61,7 +65,8 @@ function validateRows(rows: unknown, bars: boolean): asserts rows is Operational
   for (const row of rows) {
     if (!row || typeof row !== "object") throw new Error("Operational chunk contains an invalid row");
     const item = row as Record<string, unknown>;
-    if (!(["上市", "上櫃"] as unknown[]).includes(item.market) || typeof item.code !== "string" ||
+    if (!Number.isSafeInteger(item.id) || Number(item.id) < 1 ||
+      !(["上市", "上櫃"] as unknown[]).includes(item.market) || typeof item.code !== "string" ||
       typeof item.name !== "string" || !validDate(item.tradingDate) || typeof item.source !== "string") {
       throw new Error("Operational chunk row identity is invalid");
     }
@@ -120,9 +125,18 @@ async function generationStatus(d1: D1Database, generationId?: string) {
     source_sha256 AS sourceSha256,base_last_date AS baseLastDate,status,retention_trading_days AS retentionTradingDays,
     expected_bars AS expectedBars,expected_quotes AS expectedQuotes,expected_chunks AS expectedChunks,
     imported_bars AS importedBars,imported_quotes AS importedQuotes,imported_chunks AS importedChunks,
+    chunk_rows AS chunkRows,
     created_at AS createdAt,updated_at AS updatedAt,activated_at AS activatedAt,last_error AS lastError
-    FROM operational_generations WHERE generation_id=?`).bind(generationId).first() : null;
-  return { mode: "operational_generation", policy: OPERATIONAL_RETENTION, state, generation };
+    FROM operational_generations WHERE generation_id=?`).bind(generationId).first<{
+      importedBars: number; expectedBars: number; importedChunks: number; chunkRows: number;
+    }>() : null;
+  const lastChunk = generationId && generation ? await d1.prepare(`SELECT source_kind AS sourceKind,
+    source_last_id AS sourceLastId FROM operational_import_chunks WHERE generation_id=?
+    ORDER BY chunk_index DESC LIMIT 1`).bind(generationId).first<{ sourceKind: string | null; sourceLastId: number | null }>() : null;
+  const resumeKind = generation && generation.importedBars < generation.expectedBars ? "bars" : "quotes";
+  const resumeSourceId = lastChunk?.sourceKind === resumeKind ? Number(lastChunk.sourceLastId ?? 0) : 0;
+  return { mode: "operational_generation", policy: OPERATIONAL_RETENTION, state,
+    generation: generation ? { ...generation, resumeKind, resumeSourceId } : null };
 }
 
 export async function GET(request: Request) {
@@ -145,35 +159,74 @@ export async function POST(request: Request) {
     if (body.action === "start") {
       if (!validId(body.snapshotVersion) || !/^[a-f0-9]{64}$/.test(body.sourceSha256) || !validDate(body.baseLastDate)) throw new Error("Invalid snapshot identity");
       assertRetentionCoversStrategies(body.retentionTradingDays);
-      for (const value of [body.expectedBars, body.expectedQuotes, body.totalChunks]) {
+      for (const value of [body.expectedBars, body.expectedQuotes, body.totalChunks, body.chunkRows]) {
         if (!Number.isSafeInteger(value) || value < 1) throw new Error("Invalid operational import count");
       }
-      const existing = await d1.prepare("SELECT status,source_sha256 AS sourceSha256 FROM operational_generations WHERE generation_id=?").bind(body.generationId).first<{ status: string; sourceSha256: string }>();
+      if (body.chunkRows > 1_500) throw new Error("Operational chunk size exceeds the API limit");
+      const existing = await d1.prepare(`SELECT status,source_sha256 AS sourceSha256,snapshot_version AS snapshotVersion,
+        base_last_date AS baseLastDate,retention_trading_days AS retentionTradingDays,expected_bars AS expectedBars,
+        expected_quotes AS expectedQuotes,expected_chunks AS expectedChunks,chunk_rows AS chunkRows
+        FROM operational_generations WHERE generation_id=?`).bind(body.generationId).first<{
+          status: string; sourceSha256: string; snapshotVersion: string; baseLastDate: string;
+          retentionTradingDays: number; expectedBars: number; expectedQuotes: number; expectedChunks: number; chunkRows: number;
+        }>();
       if (existing) {
-        if (existing.sourceSha256 !== body.sourceSha256) throw new Error("Generation ID already belongs to another snapshot");
+        if (existing.sourceSha256 !== body.sourceSha256 || existing.snapshotVersion !== body.snapshotVersion ||
+          existing.baseLastDate !== body.baseLastDate || existing.retentionTradingDays !== body.retentionTradingDays ||
+          existing.expectedBars !== body.expectedBars || existing.expectedQuotes !== body.expectedQuotes ||
+          existing.expectedChunks !== body.totalChunks || existing.chunkRows !== body.chunkRows) {
+          throw new Error("Generation ID already belongs to different immutable import parameters");
+        }
         return Response.json(await generationStatus(d1, body.generationId));
       }
       await d1.prepare(`INSERT INTO operational_generations
         (generation_id,snapshot_version,source_sha256,base_last_date,status,retention_trading_days,
-         expected_bars,expected_quotes,expected_chunks,created_at,updated_at)
-        VALUES (?,?,?,?,'shadow',?,?,?,?,?,?)`)
+         expected_bars,expected_quotes,expected_chunks,chunk_rows,created_at,updated_at)
+        VALUES (?,?,?,?,'shadow',?,?,?,?,?,?,?)`)
         .bind(body.generationId, body.snapshotVersion, body.sourceSha256, body.baseLastDate,
-          body.retentionTradingDays, body.expectedBars, body.expectedQuotes, body.totalChunks, now, now).run();
+          body.retentionTradingDays, body.expectedBars, body.expectedQuotes, body.totalChunks, body.chunkRows, now, now).run();
       return Response.json(await generationStatus(d1, body.generationId), { status: 201 });
     }
 
     if (body.action === "chunk") {
-      if (!Number.isSafeInteger(body.chunkIndex) || body.chunkIndex < 0 || !/^[a-f0-9]{64}$/.test(body.sha256)) throw new Error("Invalid operational chunk identity");
+      if (!Number.isSafeInteger(body.chunkIndex) || body.chunkIndex < 0 || !/^[a-f0-9]{64}$/.test(body.sha256) ||
+        !["bars", "quotes"].includes(body.kind) || !Number.isSafeInteger(body.sourceLastId) || body.sourceLastId < 1) {
+        throw new Error("Invalid operational chunk identity");
+      }
       validateRows(body.bars, true); validateRows(body.quotes, false);
       if (body.bars.length + body.quotes.length < 1) throw new Error("Operational chunk is empty");
+      const rows = body.kind === "bars" ? body.bars : body.quotes;
+      if ((body.kind === "bars" && body.quotes.length) || (body.kind === "quotes" && body.bars.length) ||
+        rows.at(-1)?.id !== body.sourceLastId || rows.some((row, index) => index > 0 && row.id <= rows[index - 1].id)) {
+        throw new Error("Operational chunk cursor is invalid");
+      }
       const canonical = JSON.stringify({ bars: body.bars, quotes: body.quotes });
       if (await sha256(canonical) !== body.sha256) throw new Error("Operational chunk checksum mismatch");
-      const generation = await d1.prepare("SELECT status,expected_chunks AS expectedChunks FROM operational_generations WHERE generation_id=?").bind(body.generationId).first<{ status: string; expectedChunks: number }>();
+      const generation = await d1.prepare(`SELECT status,expected_chunks AS expectedChunks,expected_bars AS expectedBars,
+        expected_quotes AS expectedQuotes,imported_bars AS importedBars,imported_quotes AS importedQuotes,
+        imported_chunks AS importedChunks FROM operational_generations WHERE generation_id=?`).bind(body.generationId).first<{
+          status: string; expectedChunks: number; expectedBars: number; expectedQuotes: number;
+          importedBars: number; importedQuotes: number; importedChunks: number;
+        }>();
       if (!generation || generation.status !== "shadow" || body.chunkIndex >= generation.expectedChunks) throw new Error("Operational generation is not accepting chunks");
-      const prior = await d1.prepare("SELECT sha256 FROM operational_import_chunks WHERE generation_id=? AND chunk_index=?").bind(body.generationId, body.chunkIndex).first<{ sha256: string }>();
+      const prior = await d1.prepare(`SELECT sha256,source_kind AS sourceKind,source_last_id AS sourceLastId
+        FROM operational_import_chunks WHERE generation_id=? AND chunk_index=?`).bind(body.generationId, body.chunkIndex)
+        .first<{ sha256: string; sourceKind: string | null; sourceLastId: number | null }>();
       if (prior) {
-        if (prior.sha256 !== body.sha256) throw new Error("Chunk index was already imported with a different checksum");
+        if (prior.sha256 !== body.sha256 || prior.sourceKind !== body.kind || prior.sourceLastId !== body.sourceLastId) {
+          throw new Error("Chunk index was already imported with different immutable metadata");
+        }
         return Response.json({ status: "already_imported", generationId: body.generationId, chunkIndex: body.chunkIndex });
+      }
+      if (body.chunkIndex !== generation.importedChunks) throw new Error("Operational chunks must be imported sequentially");
+      const expectedKind = generation.importedBars < generation.expectedBars ? "bars" : "quotes";
+      if (body.kind !== expectedKind || generation.importedBars + body.bars.length > generation.expectedBars ||
+        generation.importedQuotes + body.quotes.length > generation.expectedQuotes) throw new Error("Operational chunk exceeds its manifest phase");
+      const previous = await d1.prepare(`SELECT source_kind AS sourceKind,source_last_id AS sourceLastId
+        FROM operational_import_chunks WHERE generation_id=? ORDER BY chunk_index DESC LIMIT 1`).bind(body.generationId)
+        .first<{ sourceKind: string | null; sourceLastId: number | null }>();
+      if (previous?.sourceKind === body.kind && body.sourceLastId <= Number(previous.sourceLastId ?? 0)) {
+        throw new Error("Operational chunk cursor did not advance");
       }
       const statements: D1PreparedStatement[] = [];
       if (body.bars.length) {
@@ -185,8 +238,10 @@ export async function POST(request: Request) {
         statements.push(quotesUpsert(d1, body.generationId, payload, now), securitiesUpsert(d1, body.generationId, payload));
       }
       statements.push(d1.prepare(`INSERT INTO operational_import_chunks
-        (generation_id,chunk_index,sha256,bars_written,quotes_written,imported_at) VALUES (?,?,?,?,?,?)`)
-        .bind(body.generationId, body.chunkIndex, body.sha256, body.bars.length, body.quotes.length, now));
+        (generation_id,chunk_index,sha256,bars_written,quotes_written,source_kind,source_last_id,imported_at)
+        VALUES (?,?,?,?,?,?,?,?)`)
+        .bind(body.generationId, body.chunkIndex, body.sha256, body.bars.length, body.quotes.length,
+          body.kind, body.sourceLastId, now));
       statements.push(d1.prepare(`UPDATE operational_generations SET imported_bars=imported_bars+?,
         imported_quotes=imported_quotes+?,imported_chunks=imported_chunks+1,updated_at=?,last_error=NULL WHERE generation_id=?`)
         .bind(body.bars.length, body.quotes.length, now, body.generationId));

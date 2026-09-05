@@ -2,13 +2,10 @@ name: Rebuild Operational Database From Historical Snapshot
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/operational-rebuild.yml"
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: wall-explorer-operational-rebuild
@@ -25,6 +22,7 @@ jobs:
       R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
       WALL_EXPLORER_URL: ${{ vars.WALL_EXPLORER_URL }}
       OAI_SITES_AUTHORIZATION: ${{ secrets.OAI_SITES_AUTHORIZATION }}
+      OPERATIONAL_MAX_SECONDS: "2400"
       OPERATIONAL_SQLITE_PATH: /tmp/wall-explorer-historical.sqlite
       OPERATIONAL_POINTER_PATH: /tmp/historical-snapshot-pointer.json
     steps:
@@ -66,7 +64,13 @@ jobs:
           aws --endpoint-url "$endpoint" s3 cp --only-show-errors "s3://${R2_BUCKET}/${key}" - | gzip -dc > "$OPERATIONAL_SQLITE_PATH"
           test "$(sha256sum "$OPERATIONAL_SQLITE_PATH" | awk '{print $1}')" = "$raw_sha"
       - name: Build shadow generation, catch up, and atomically activate
+        id: operational
         run: node --experimental-strip-types scripts/import-operational-generation.mjs
+      - name: Dispatch the next bounded import batch
+        if: steps.operational.outputs.continue == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run operational-rebuild.yml --ref main
       - name: Remove runner-local full snapshot
         if: always()
         shell: bash
