@@ -61,8 +61,9 @@ test("legacy TPEx full-market fallback keeps delisted candidates and point-in-ti
   assert.match(sources[1], /daily_close_quotes\/stk_quote_result\.php/);
 });
 
-test("transient 429/5xx responses use exponential backoff and then continue", async () => {
+test("transient redirect/429/5xx responses use exponential backoff and then continue", async () => {
   const responses = [
+    new Response(null, { status: 307 }),
     new Response("rate limited", { status: 429 }),
     new Response("busy", { status: 503 }),
     new Response(JSON.stringify({ stat: "OK", date: "20250417", tables: [{
@@ -80,9 +81,9 @@ test("transient 429/5xx responses use exponential backoff and then continue", as
     backoffBaseMs: 10,
     maxBackoffMs: 100,
   });
-  assert.equal(calls, 3);
-  assert.deepEqual(delays, [10, 20]);
-  assert.equal(result.profile.retryCount, 2);
+  assert.equal(calls, 4);
+  assert.deepEqual(delays, [10, 20, 40]);
+  assert.equal(result.profile.retryCount, 3);
   assert.equal(result.profile.rateLimited, true);
   assert.equal(result.unitStatus, "completed");
   assert.equal(result.observations.length, 1);
