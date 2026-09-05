@@ -241,6 +241,8 @@ test("daily incremental has an external server runner", async () => {
   assert.match(runner, /INCREMENTAL_BATCH_DATES \?\? 20/);
   assert.match(runner, /AbortSignal\.timeout\(45_000\)/);
   assert.match(runner, /output\("continue", "true"\)/);
+  assert.match(runner, /fetchHistoricalMarketDay/);
+  assert.match(runner, /units/);
 });
 
 test("legacy D1 checkpoint export is owner-gated, compressed, and read-only", async () => {

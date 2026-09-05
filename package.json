@@ -22,7 +22,7 @@
     "snapshot:r2:promote": "bash scripts/r2-checkpoint-lifecycle.sh promote",
     "snapshot:r2:finalize": "bash scripts/r2-finalize-lifecycle.sh finalize",
     "snapshot:r2:gc-plan": "bash scripts/r2-historical-gc.sh plan",
-    "incremental:run": "node scripts/run-daily-incremental.mjs"
+    "incremental:run": "node --experimental-strip-types scripts/run-daily-incremental.mjs"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",

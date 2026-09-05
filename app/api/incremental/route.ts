@@ -85,7 +85,8 @@ async function state(d1: D1Database, requestedGeneration?: string | null) {
   const runs = generation ? await d1.prepare(`SELECT market,trading_date AS tradingDate,status,rows_stored AS rowsStored,
     attempts,last_error AS lastError,updated_at AS updatedAt FROM operational_ingestion_units
     WHERE generation_id=? ORDER BY trading_date DESC,market LIMIT 8`).bind(generation.generationId).all() : { results: [] };
-  return { mode: "operational_incremental", active, generation, lastCompletedDate: throughDate, runs: runs.results };
+  return { mode: "operational_incremental", active, generation, lastCompletedDate: throughDate,
+    targetDate: latestCompletedMarketDate(), runs: runs.results };
 }
 
 export async function GET() {
@@ -96,7 +97,9 @@ export async function GET() {
 export async function POST(request: Request) {
   if (!authorized(request)) return Response.json({ status: "unauthorized" }, { status: 401 });
   try {
-    const input = await request.json().catch(() => ({})) as { generationId?: string };
+    const input = await request.json().catch(() => ({})) as { generationId?: string; units?: Array<{
+      market: HistoricalMarket; tradingDate: string; observations: HistoricalObservation[];
+    }> };
     const d1 = await getRawDb();
     const current = await state(d1, input.generationId);
     const generation = current.generation;
@@ -120,6 +123,7 @@ export async function POST(request: Request) {
       FROM operational_ingestion_units WHERE generation_id=? AND trading_date=?`)
       .bind(generation.generationId, tradingDate).all<{ market: HistoricalMarket; status: string; rowsFetched: number }>();
     const savedByMarket = new Map(savedUnits.results.map((unit) => [unit.market, unit]));
+    const suppliedByMarket = new Map((input.units ?? []).map((unit) => [unit.market, unit]));
     const marketResults = await Promise.all(markets.map(async (market) => {
       const saved = savedByMarket.get(market);
       if (saved && ["complete", "validated_empty"].includes(saved.status)) {
@@ -127,11 +131,16 @@ export async function POST(request: Request) {
           error: null as string | null, skipped: true };
       }
       try {
-        const result = await fetchHistoricalMarketDay(market, tradingDate, { maxAttempts: 1, timeoutMs: market === "上櫃" ? 12_000 : 8_000 });
-        const audit = auditBiasGuards(result.observations, tradingDate);
+        const supplied = suppliedByMarket.get(market);
+        if (supplied && (supplied.tradingDate !== tradingDate || supplied.observations.some((row) => row.market !== market || row.tradingDate !== tradingDate))) {
+          throw new Error("Supplied official market unit does not match the requested market date");
+        }
+        const rows = supplied?.observations ?? (await fetchHistoricalMarketDay(market, tradingDate,
+          { maxAttempts: 1, timeoutMs: market === "上櫃" ? 12_000 : 8_000 })).observations;
+        const audit = auditBiasGuards(rows, tradingDate);
         if (audit.survivorship.status !== "pass" || audit.lookAhead.status !== "pass") throw new Error("Bias validation blocked incremental data");
-        return { market, rows: result.observations, rowsFetched: result.observations.length,
-          checksum: await sha256(JSON.stringify(result.observations)), error: null as string | null, skipped: false };
+        return { market, rows, rowsFetched: rows.length, checksum: await sha256(JSON.stringify(rows)),
+          error: null as string | null, skipped: false };
       } catch (error) {
         return { market, rows: [] as HistoricalObservation[], rowsFetched: 0, checksum: null,
           error: error instanceof Error ? error.message : "Unknown error", skipped: false };
