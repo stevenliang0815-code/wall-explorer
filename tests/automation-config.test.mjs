@@ -260,3 +260,4 @@ test("legacy D1 checkpoint export is owner-gated, compressed, and read-only", as
   assert.match(route, /Content-Disposition/);
   assert.doesNotMatch(route, /\b(?:INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER)\b/i);
 });
+

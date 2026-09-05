@@ -415,3 +415,4 @@ export async function fetchHistoricalMarketDay(market: HistoricalMarket, trading
   }
   throw Object.assign(new HistoricalUnitError("transient", `Official historical source remained unavailable after ${profile.attempts} attempts: ${lastError?.message ?? "unknown error"}`, { cause: lastError }), { fetchProfile: profile });
 }
+
