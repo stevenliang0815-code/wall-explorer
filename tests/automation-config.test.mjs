@@ -222,7 +222,8 @@ test("daily GitHub Action updates both markets through the server API", async ()
   assert.match(workflow, /npm run incremental:run/);
   assert.match(workflow, /actions: write/);
   assert.match(workflow, /steps\.incremental\.outputs\.continue == 'true'/);
-  assert.match(workflow, /gh workflow run daily-incremental\.yml --ref main/);
+  assert.match(workflow, /INCREMENTAL_DEFERRED_ATTEMPT/);
+  assert.match(workflow, /gh workflow run daily-incremental\.yml --ref main -f deferred_attempt=/);
 });
 
 test("legacy cloud job endpoint remains compatible but is no longer exposed by the Web App", async () => {
@@ -239,6 +240,10 @@ test("daily incremental has an external server runner", async () => {
   assert.match(runner, /OAI_SITES_AUTHORIZATION/);
   assert.doesNotMatch(runner, /window|navigator|serviceWorker/i);
   assert.match(runner, /INCREMENTAL_BATCH_DATES \?\? 20/);
+  assert.match(runner, /INCREMENTAL_DEFERRED_ATTEMPT \?\? 0/);
+  assert.match(runner, /maxDeferredAttempts = 6/);
+  assert.match(runner, /status: "source_deferred"/);
+  assert.match(runner, /output\("deferred_attempt", String\(deferredAttempt \+ 1\)\)/);
   assert.match(runner, /AbortSignal\.timeout\(45_000\)/);
   assert.match(runner, /output\("continue", "true"\)/);
   assert.match(runner, /fetchHistoricalMarketDay/);
@@ -255,3 +260,4 @@ test("legacy D1 checkpoint export is owner-gated, compressed, and read-only", as
   assert.match(route, /Content-Disposition/);
   assert.doesNotMatch(route, /\b(?:INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER)\b/i);
 });
+
