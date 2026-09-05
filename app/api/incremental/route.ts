@@ -153,16 +153,18 @@ export async function POST(request: Request) {
     }
 
     const now = new Date().toISOString();
-    const statements: D1PreparedStatement[] = [];
+    const unitStatements: D1PreparedStatement[] = [];
     for (const unit of marketResults) {
       if (unit.skipped) continue;
       for (const payload of payloads(unit.rows)) {
-        statements.push(barUpsert(d1, generation.generationId, payload, now));
-        statements.push(quoteUpsert(d1, generation.generationId, payload, now));
-        statements.push(securityUpsert(d1, generation.generationId, payload));
+        await d1.batch([
+          barUpsert(d1, generation.generationId, payload, now),
+          quoteUpsert(d1, generation.generationId, payload, now),
+          securityUpsert(d1, generation.generationId, payload),
+        ]);
       }
       const stored = unit.rows.filter((row) => row.securityType === "ordinary_equity_candidate").length;
-      statements.push(d1.prepare(`INSERT INTO operational_ingestion_units
+      unitStatements.push(d1.prepare(`INSERT INTO operational_ingestion_units
         (generation_id,market,trading_date,status,rows_fetched,rows_stored,source_checksum,attempts,last_error,updated_at)
         VALUES (?,?,?,?,?,?,?,1,?,?) ON CONFLICT(generation_id,market,trading_date) DO UPDATE SET
         status=excluded.status,rows_fetched=excluded.rows_fetched,rows_stored=excluded.rows_stored,
@@ -173,7 +175,7 @@ export async function POST(request: Request) {
           unit.error ? 0 : unit.rowsFetched, unit.error ? 0 : stored, unit.checksum,
           unit.error?.slice(0, 500) ?? null, now));
     }
-    await d1.batch(statements);
+    if (unitStatements.length) await d1.batch(unitStatements);
     const hasGap = marketResults.some((unit) => unit.error);
     if (hasGap) {
       return Response.json({ status: "retry_required", generationId: generation.generationId, tradingDate, targetDate,
