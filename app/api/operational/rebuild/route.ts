@@ -45,7 +45,7 @@ type ChunkRequest = {
   quotes: OperationalRow[];
 };
 
-type GenerationRequest = { action: "validate" | "activate" | "cleanup"; generationId: string };
+type GenerationRequest = { action: "validate" | "activate" | "cleanup"; generationId: string; allowStaleBootstrap?: boolean };
 
 function authorized(request: Request) {
   return request.headers.get("x-dispatched-app")?.startsWith("site---") ||
@@ -276,7 +276,9 @@ export async function POST(request: Request) {
       )`).bind(body.generationId).first<{ tradingDate: string | null }>();
       const throughDate = checkpoint?.tradingDate ?? generation.baseLastDate;
       const targetDate = latestCompletedMarketDate();
-      if (throughDate < targetDate) throw new Error(`Shadow generation is only caught up through ${throughDate}; target is ${targetDate}`);
+      if (throughDate < targetDate && body.allowStaleBootstrap !== true) {
+        throw new Error(`Shadow generation is only caught up through ${throughDate}; target is ${targetDate}`);
+      }
       const freshness = freshnessStatus(throughDate, targetDate);
       await d1.batch([
         d1.prepare("UPDATE operational_generations SET status='retired',updated_at=? WHERE status='active' AND generation_id<>?").bind(now, body.generationId),

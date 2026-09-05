@@ -97,6 +97,8 @@ test("operational rebuild is separate and never triggers Historical lifecycle", 
   assert.doesNotMatch(workflow, /historical-backfill\.yml|historical-finalize\.yml/);
   assert.match(importer, /action: "validate"/);
   assert.match(importer, /action: "activate"/);
+  assert.match(importer, /allowStaleBootstrap: true/);
+  assert.doesNotMatch(importer, /post\("\/api\/incremental"/);
   assert.match(importer, /OPERATIONAL_RETENTION\.retentionTradingDays/);
   assert.match(importer, /PRAGMA quick_check/);
   assert.match(importer, /GROUP BY market/);

@@ -133,16 +133,7 @@ if (status === "shadow") {
   log("operational_generation_validated", { generationId, chunkIndex });
 }
 
-let increments = 0;
-while (increments < 600) {
-  if (!hasTimeForNextRequest()) { continueLater(generationId, "incremental", chunkIndex); db.close(); process.exit(0); }
-  const result = await post("/api/incremental", { generationId });
-  increments += 1;
-  if (result.status === "caught_up") break;
-  if (result.status !== "continue") throw new Error(`Unexpected incremental status: ${result.status}`);
-}
-if (increments >= 600) throw new Error("Operational shadow catch-up exceeded 600 market days");
-const activated = await post(endpoint.pathname, { action: "activate", generationId });
+const activated = await post(endpoint.pathname, { action: "activate", generationId, allowStaleBootstrap: true });
 log("operational_generation_active", { generationId, baseLastDate, cutoff, expectedBars, expectedQuotes,
-  retentionTradingDays: OPERATIONAL_RETENTION.retentionTradingDays, increments, state: activated.state });
+  retentionTradingDays: OPERATIONAL_RETENTION.retentionTradingDays, state: activated.state });
 db.close();
