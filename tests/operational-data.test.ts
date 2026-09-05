@@ -76,6 +76,8 @@ test("daily APIs read the active operational generation after bootstrap", async 
   assert.match(incremental, /savedByMarket/);
   assert.match(incremental, /maxAttempts: 1/);
   assert.match(incremental, /timeoutMs:/);
+  assert.match(incremental, /suppliedByMarket/);
+  assert.match(incremental, /Supplied official market unit does not match/);
   assert.match(incremental, /DELETE FROM operational_daily_bars/);
   assert.doesNotMatch(incremental, /historical_observations/);
 });

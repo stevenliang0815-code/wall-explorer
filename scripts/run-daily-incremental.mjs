@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import { appendFileSync } from "node:fs";
+import { auditBiasGuards, fetchHistoricalMarketDay } from "../lib/historical-data.ts";
+import { nextWeekday } from "../lib/operational-time.ts";
 
 const baseUrl = process.env.WALL_EXPLORER_URL;
 const token = process.env.OAI_SITES_AUTHORIZATION;
@@ -21,10 +23,32 @@ function output(name, value) {
 
 let transientAttempts = 0;
 while (iterations < maxIterations) {
+  const stateResponse = await fetch(endpoint, {
+    headers: { "OAI-Sites-Authorization": `Bearer ${token}` },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!stateResponse.ok) throw new Error(`Could not read incremental state (${stateResponse.status})`);
+  const state = await stateResponse.json();
+  if (!state.generation) throw new Error("No operational generation is available");
+  const anchor = state.lastCompletedDate ?? state.generation.baseLastDate;
+  const tradingDate = nextWeekday(anchor);
+  const saved = new Map((state.runs ?? []).filter((unit) => unit.tradingDate === tradingDate).map((unit) => [unit.market, unit]));
+  const units = [];
+  if (tradingDate <= state.targetDate) {
+    for (const market of ["上市", "上櫃"]) {
+      if (["complete", "validated_empty"].includes(saved.get(market)?.status)) continue;
+      const result = await fetchHistoricalMarketDay(market, tradingDate, { maxAttempts: 3, timeoutMs: 15_000 });
+      const audit = auditBiasGuards(result.observations, tradingDate);
+      if (audit.survivorship.status !== "pass" || audit.lookAhead.status !== "pass") {
+        throw new Error(`Bias validation blocked ${market} ${tradingDate}`);
+      }
+      units.push({ market, tradingDate, observations: result.observations });
+    }
+  }
   const response = await fetch(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json", "OAI-Sites-Authorization": `Bearer ${token}` },
-    body: JSON.stringify(generationId ? { generationId } : {}),
+    body: JSON.stringify({ ...(generationId ? { generationId } : {}), units }),
     signal: AbortSignal.timeout(45_000),
   });
   const body = await response.json();
