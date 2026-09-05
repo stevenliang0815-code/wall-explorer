@@ -220,6 +220,9 @@ test("daily GitHub Action updates both markets through the server API", async ()
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /cron: "5 9 \* \* 1-5"/);
   assert.match(workflow, /npm run incremental:run/);
+  assert.match(workflow, /actions: write/);
+  assert.match(workflow, /steps\.incremental\.outputs\.continue == 'true'/);
+  assert.match(workflow, /gh workflow run daily-incremental\.yml --ref main/);
 });
 
 test("legacy cloud job endpoint remains compatible but is no longer exposed by the Web App", async () => {
@@ -235,7 +238,9 @@ test("daily incremental has an external server runner", async () => {
   assert.match(runner, /\/api\/incremental/);
   assert.match(runner, /OAI_SITES_AUTHORIZATION/);
   assert.doesNotMatch(runner, /window|navigator|serviceWorker/i);
-  assert.match(runner, /while \(iterations < 5_000\)/);
+  assert.match(runner, /INCREMENTAL_BATCH_DATES \?\? 20/);
+  assert.match(runner, /AbortSignal\.timeout\(45_000\)/);
+  assert.match(runner, /output\("continue", "true"\)/);
 });
 
 test("legacy D1 checkpoint export is owner-gated, compressed, and read-only", async () => {

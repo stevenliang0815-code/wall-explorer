@@ -116,25 +116,37 @@ export async function POST(request: Request) {
       return Response.json({ status: "caught_up", generationId: generation.generationId, throughDate: anchor, targetDate });
     }
 
+    const savedUnits = await d1.prepare(`SELECT market,status,rows_fetched AS rowsFetched
+      FROM operational_ingestion_units WHERE generation_id=? AND trading_date=?`)
+      .bind(generation.generationId, tradingDate).all<{ market: HistoricalMarket; status: string; rowsFetched: number }>();
+    const savedByMarket = new Map(savedUnits.results.map((unit) => [unit.market, unit]));
     const marketResults = await Promise.all(markets.map(async (market) => {
+      const saved = savedByMarket.get(market);
+      if (saved && ["complete", "validated_empty"].includes(saved.status)) {
+        return { market, rows: [] as HistoricalObservation[], rowsFetched: saved.rowsFetched, checksum: null,
+          error: null as string | null, skipped: true };
+      }
       try {
-        const result = await fetchHistoricalMarketDay(market, tradingDate);
+        const result = await fetchHistoricalMarketDay(market, tradingDate, { maxAttempts: 1, timeoutMs: market === "上櫃" ? 12_000 : 8_000 });
         const audit = auditBiasGuards(result.observations, tradingDate);
         if (audit.survivorship.status !== "pass" || audit.lookAhead.status !== "pass") throw new Error("Bias validation blocked incremental data");
-        return { market, rows: result.observations, checksum: await sha256(JSON.stringify(result.observations)), error: null as string | null };
+        return { market, rows: result.observations, rowsFetched: result.observations.length,
+          checksum: await sha256(JSON.stringify(result.observations)), error: null as string | null, skipped: false };
       } catch (error) {
-        return { market, rows: [] as HistoricalObservation[], checksum: null, error: error instanceof Error ? error.message : "Unknown error" };
+        return { market, rows: [] as HistoricalObservation[], rowsFetched: 0, checksum: null,
+          error: error instanceof Error ? error.message : "Unknown error", skipped: false };
       }
     }));
-    const nonEmpty = marketResults.filter((unit) => unit.rows.length > 0).length;
+    const nonEmpty = marketResults.filter((unit) => unit.rowsFetched > 0).length;
     if (nonEmpty === 1) {
-      const empty = marketResults.find((unit) => unit.rows.length === 0 && !unit.error);
-      if (empty) empty.error = "同日另一市場有資料，但本市場為空；等待兩市場資料完整。";
+      const empty = marketResults.find((unit) => unit.rowsFetched === 0 && !unit.error);
+      if (empty) { empty.error = "同日另一市場有資料，但本市場為空；等待兩市場資料完整。"; empty.skipped = false; }
     }
 
     const now = new Date().toISOString();
     const statements: D1PreparedStatement[] = [];
     for (const unit of marketResults) {
+      if (unit.skipped) continue;
       for (const payload of payloads(unit.rows)) {
         statements.push(barUpsert(d1, generation.generationId, payload, now));
         statements.push(quoteUpsert(d1, generation.generationId, payload, now));
@@ -149,14 +161,14 @@ export async function POST(request: Request) {
         last_error=excluded.last_error,updated_at=excluded.updated_at`)
         .bind(generation.generationId, unit.market, tradingDate,
           unit.error ? "failed" : unit.rows.length ? "complete" : "validated_empty",
-          unit.error ? 0 : unit.rows.length, unit.error ? 0 : stored, unit.checksum,
+          unit.error ? 0 : unit.rowsFetched, unit.error ? 0 : stored, unit.checksum,
           unit.error?.slice(0, 500) ?? null, now));
     }
     await d1.batch(statements);
     const hasGap = marketResults.some((unit) => unit.error);
     if (hasGap) {
       return Response.json({ status: "retry_required", generationId: generation.generationId, tradingDate, targetDate,
-        markets: marketResults.map((unit) => ({ market: unit.market, rowsFetched: unit.rows.length, error: unit.error })) }, { status: 503 });
+        markets: marketResults.map((unit) => ({ market: unit.market, rowsFetched: unit.rowsFetched, resumed: unit.skipped, error: unit.error })) }, { status: 503 });
     }
 
     const cutoff = await d1.prepare(`SELECT min(trading_date) AS cutoff FROM (
@@ -184,7 +196,7 @@ export async function POST(request: Request) {
     return Response.json({ status, generationId: generation.generationId, tradingDate, targetDate,
       rowsFetched: marketResults.reduce((sum, unit) => sum + unit.rows.length, 0),
       barsStored: marketResults.reduce((sum, unit) => sum + unit.rows.filter((row) => row.securityType === "ordinary_equity_candidate").length, 0),
-      markets: marketResults.map((unit) => ({ market: unit.market, rowsFetched: unit.rows.length })) }, { status: status === "continue" ? 202 : 200 });
+      markets: marketResults.map((unit) => ({ market: unit.market, rowsFetched: unit.rowsFetched, resumed: unit.skipped })) }, { status: status === "continue" ? 202 : 200 });
   } catch (error) {
     return Response.json({ status: "error", error: error instanceof Error ? error.message : "Unknown incremental error" }, { status: 503 });
   }

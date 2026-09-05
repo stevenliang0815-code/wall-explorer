@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { appendFileSync } from "node:fs";
+
 const baseUrl = process.env.WALL_EXPLORER_URL;
 const token = process.env.OAI_SITES_AUTHORIZATION;
 
@@ -11,17 +13,23 @@ const endpoint = new URL("/api/incremental", baseUrl);
 const generationId = process.env.OPERATIONAL_GENERATION_ID;
 let iterations = 0;
 let rowsWritten = 0;
+const maxIterations = Math.max(1, Number(process.env.INCREMENTAL_BATCH_DATES ?? 20));
+
+function output(name, value) {
+  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value}\n`);
+}
 
 let transientAttempts = 0;
-while (iterations < 5_000) {
+while (iterations < maxIterations) {
   const response = await fetch(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json", "OAI-Sites-Authorization": `Bearer ${token}` },
     body: JSON.stringify(generationId ? { generationId } : {}),
+    signal: AbortSignal.timeout(45_000),
   });
   const body = await response.json();
   if (!response.ok && response.status !== 202) {
-    if ([408, 425, 429, 500, 502, 503, 504].includes(response.status) && transientAttempts < 7) {
+    if ([408, 425, 429, 500, 502, 503, 504].includes(response.status) && transientAttempts < 2) {
       transientAttempts += 1;
       await new Promise((resolve) => setTimeout(resolve, Math.min(30_000, 500 * 2 ** transientAttempts) + Math.floor(Math.random() * 750)));
       continue;
@@ -29,12 +37,14 @@ while (iterations < 5_000) {
     throw new Error(`Daily incremental update failed (${response.status}): ${body.error ?? body.status ?? "unknown error"}`);
   }
   transientAttempts = 0;
-  rowsWritten += body.rowsWritten ?? 0;
+  rowsWritten += body.barsStored ?? 0;
   iterations += 1;
   if (body.status === "caught_up") {
-      console.log(JSON.stringify({ status: body.status, generationId: body.generationId, throughDate: body.tradingDate ?? body.throughDate, rowsWritten, iterations }));
+    output("continue", "false");
+    console.log(JSON.stringify({ status: body.status, generationId: body.generationId, throughDate: body.tradingDate ?? body.throughDate, rowsWritten, iterations }));
     process.exit(0);
   }
 }
 
-throw new Error("Daily incremental catch-up exceeded the safety iteration limit");
+output("continue", "true");
+console.log(JSON.stringify({ status: "batch_complete", rowsWritten, iterations }));
