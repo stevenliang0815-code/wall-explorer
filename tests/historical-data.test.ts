@@ -47,7 +47,7 @@ test("look-ahead audit blocks same-day feature availability", () => {
   assert.equal(audit.lookAhead.violations, 1);
 });
 
-test("legacy TPEx full-market fallback keeps delisted candidates and point-in-time availability", () => {
+test("legacy TPEx full-market parser keeps delisted candidates and point-in-time availability", () => {
   const rows = parseLegacyTpexReport({ aaData: [
     ["5274", "信驊", "5,000", "25", "4,980", "5,020", "4,950", "4,990", "12,000", "60,000,000"],
     ["1234", "後來下櫃樣本", "40", "-2", "42", "43", "39", "41", "2,000", "80,000"],
@@ -57,8 +57,30 @@ test("legacy TPEx full-market fallback keeps delisted candidates and point-in-ti
   assert.equal(rows[1].usableFrom, "2020-01-03T00:00:00+08:00");
   assert.equal(auditBiasGuards(rows, "2020-01-02").lookAhead.status, "pass");
   const sources = historicalSourceUrls("上櫃", "2020-01-02");
+  assert.equal(sources.length, 1);
   assert.match(sources[0], /\/www\/zh-tw\/afterTrading\/dailyQuotes/);
-  assert.match(sources[1], /daily_close_quotes\/stk_quote_result\.php/);
+});
+
+test("TPEx does not fall back to the legacy endpoint that ignores historical dates", async () => {
+  const calls: string[] = [];
+  await assert.rejects(
+    fetchHistoricalMarketDay("上櫃", "2026-03-16", {
+      fetchImpl: async (source) => {
+        calls.push(String(source));
+        throw new TypeError("fetch failed: ETIMEDOUT");
+      },
+      delayImpl: async () => {},
+      random: () => 0,
+      maxAttempts: 2,
+      hostSpacingMs: 0,
+      backoffBaseMs: 0,
+      maxBackoffMs: 0,
+    }),
+    (error) => error instanceof HistoricalUnitError && error.category === "transient",
+  );
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every((source) => source.includes("/www/zh-tw/afterTrading/dailyQuotes")));
+  assert.ok(calls.every((source) => !source.includes("stk_quote_result.php")));
 });
 
 test("transient redirect/429/5xx responses use exponential backoff and then continue", async () => {

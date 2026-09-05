@@ -138,15 +138,7 @@ export function historicalSourceUrl(market: HistoricalMarket, tradingDate: strin
 
 export function historicalSourceUrls(market: HistoricalMarket, tradingDate: string) {
   if (market === "上市") return [historicalSourceUrl(market, tradingDate)];
-  const rocYear = Number(tradingDate.slice(0, 4)) - 1911;
-  const rocDate = `${rocYear}/${tradingDate.slice(5, 7)}/${tradingDate.slice(8, 10)}`;
-  const legacy = new URL("https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php");
-  legacy.searchParams.set("l", "zh-tw");
-  legacy.searchParams.set("o", "json");
-  legacy.searchParams.set("d", rocDate);
-  // Prefer the dated endpoint. The legacy URL can redirect and ignore its date,
-  // so it is retained only as a validated fallback.
-  return [historicalSourceUrl(market, tradingDate), legacy.toString()];
+  return [historicalSourceUrl(market, tradingDate)];
 }
 
 function rowCells(row: unknown, fields: string[]) {
