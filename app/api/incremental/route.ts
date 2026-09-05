@@ -10,7 +10,7 @@ function authorized(request: Request) {
   return request.headers.get("x-dispatched-app")?.startsWith("site---") || request.headers.get("x-wall-incremental-trigger") === "scheduled";
 }
 
-function payloads(rows: HistoricalObservation[], target = 600_000) {
+function payloads(rows: HistoricalObservation[], target = 1_500_000) {
   const result: string[] = []; let current: HistoricalObservation[] = []; let bytes = 2;
   for (const row of rows) {
     const encoded = JSON.stringify(row);
