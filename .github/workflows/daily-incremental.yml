@@ -2,6 +2,11 @@ name: Daily TWSE and TPEx Incremental Update
 
 on:
   workflow_dispatch:
+    inputs:
+      deferred_attempt:
+        description: Consecutive automatic retries after a transient official-source failure
+        required: false
+        default: "0"
   schedule:
     - cron: "5 9 * * 1-5"
 
@@ -21,6 +26,7 @@ jobs:
       WALL_EXPLORER_URL: ${{ vars.WALL_EXPLORER_URL }}
       OAI_SITES_AUTHORIZATION: ${{ secrets.OAI_SITES_AUTHORIZATION }}
       INCREMENTAL_BATCH_DATES: 20
+      INCREMENTAL_DEFERRED_ATTEMPT: ${{ inputs.deferred_attempt || '0' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -35,4 +41,5 @@ jobs:
         if: steps.incremental.outputs.continue == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run daily-incremental.yml --ref main
+          NEXT_DEFERRED_ATTEMPT: ${{ steps.incremental.outputs.deferred_attempt }}
+        run: gh workflow run daily-incremental.yml --ref main -f deferred_attempt="${NEXT_DEFERRED_ATTEMPT:-0}"
