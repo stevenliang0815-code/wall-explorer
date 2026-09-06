@@ -6,6 +6,8 @@
     "node": ">=22.13.0"
   },
   "scripts": {
+    "backtest:run": "node scripts/run-strategy-backtest.mjs",
+    "backtest:test": "node --test tests/backtest.test.mjs",
     "install:ci": "bash scripts/install-ci.sh",
     "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vite",
     "build": "bash scripts/build-verified.sh",
