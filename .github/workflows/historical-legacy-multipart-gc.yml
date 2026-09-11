@@ -2,11 +2,6 @@ name: Historical Legacy Multipart Garbage Collection
 
 "on":
   workflow_dispatch: {}
-  workflow_run:
-    workflows: ["Historical Multipart Private Classification"]
-    types: [completed]
-  schedule:
-    - cron: "17 */6 * * *"
 
 permissions:
   contents: read
@@ -17,7 +12,6 @@ concurrency:
 
 jobs:
   gc:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -38,7 +32,45 @@ jobs:
           for key in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do test -n "${!key:-}"; done
           bash -n scripts/r2-historical-common.sh scripts/r2-legacy-multipart-gc.sh
           node --test tests/r2-legacy-multipart-gc.test.mjs
+      - name: Read-only finalized checkpoint preflight
+        id: preflight
+        env:
+          AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          AWS_PAGER: ""
+        shell: python
+        run: |
+          import json, os, subprocess
+          def read_json(*args):
+              return json.loads(subprocess.check_output([
+                  "aws", "--endpoint-url", "https://" + os.environ["R2_ACCOUNT_ID"] + ".r2.cloudflarestorage.com",
+                  *args], text=True))
+          pointer = read_json("s3", "cp", "s3://" + os.environ["R2_BUCKET"] + "/checkpoints/historical/latest.json", "-", "--only-show-errors")
+          if not isinstance(pointer, dict) or not isinstance(pointer.get("status"), str):
+              raise ValueError("Invalid historical checkpoint pointer")
+          run_gc = True
+          if pointer["status"] == "finalized":
+              listing = read_json("s3api", "list-multipart-uploads", "--bucket", os.environ["R2_BUCKET"],
+                                  "--prefix", "checkpoints/historical/versions/", "--output", "json")
+              uploads = listing.get("Uploads", [])
+              if not isinstance(uploads, list):
+                  raise ValueError("Invalid multipart listing")
+              # Do not interpret a truncated response as proof that no uploads exist.
+              if listing.get("IsTruncated") or listing.get("NextKeyMarker") or listing.get("NextUploadIdMarker"):
+                  raise RuntimeError("Multipart listing is incomplete; manual review required")
+              if uploads:
+                  raise RuntimeError("Historical raw is finalized, but legacy multipart uploads remain; manual emergency review required")
+              run_gc = False
+              summary = "## Legacy GC: normal no-op\n\nHistorical raw checkpoint is finalized and no legacy multipart uploads remain. Nothing to collect. No R2 objects, pointers, GC cursors, or production data were changed.\n"
+              print(summary)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as stream:
+                  stream.write(summary)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+              stream.write("run_gc=" + str(run_gc).lower() + "\n")
       - name: Full paginated Legacy Multipart GC
+        if: steps.preflight.outputs.run_gc == 'true'
         run: |
           set -euo pipefail
           bash scripts/r2-legacy-multipart-gc.sh gc | tee -a "$GITHUB_STEP_SUMMARY"
