@@ -61,11 +61,17 @@ jobs:
               c=sqlite3.connect(db.as_uri()+'?mode=ro&immutable=1',uri=True)
               c.row_factory=sqlite3.Row
               c.execute('PRAGMA query_only=ON')
-              def rows(q):return [dict(r) for r in c.execute(q)]
+              def rows(q):
+                  result=[dict(r) for r in c.execute(q)]
+                  for r in result:
+                      if 'market' in r:r['market']={'上市':'TWSE','上櫃':'TPEX'}.get(r['market'],r['market'])
+                  return result
               try:
                   integrity=[r[0] for r in c.execute('PRAGMA integrity_check')]
                   if integrity!=['ok']:raise RuntimeError('SQLite integrity failed')
-                  where="trading_date>='2025-01-01' AND trading_date<'2026-01-01' AND market IN ('TWSE','TPEX')"
+                  where="trading_date>='2025-01-01' AND trading_date<'2026-01-01' AND market IN ('上市','上櫃','TWSE','TPEX')"
+                  counts=rows('SELECT market,count(*) AS observations FROM historical_observations WHERE '+where+' GROUP BY market')
+                  if {r['market'] for r in counts}!={'TWSE','TPEX'}:raise RuntimeError('Both 2025 markets must contain observations')
                   return {'integrityCheck':integrity,'scope_year':2025,
                     'tables':{'historical_observations':{'rowCount':c.execute('SELECT count(*) FROM historical_observations').fetchone()[0]}},
                     'candidates':rows('SELECT market,code,name,security_type,min(trading_date) AS observed_from,max(trading_date) AS observed_to,count(*) AS observations FROM historical_observations WHERE '+where+' GROUP BY market,code,name,security_type ORDER BY market,code,name,security_type'),
@@ -137,6 +143,8 @@ jobs:
                   shutil.rmtree(temp)
                   report['temporarySnapshotDeleted'] = not temp.exists()
                   output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+                  import base64
+                  print('IDENTITY_REPORT_GZIP_BASE64=' + base64.b64encode(gzip.compress(output.read_bytes(), mtime=0)).decode('ascii'), flush=True)
                   print('IDENTITY_CANDIDATES=' + str(len(report.get('sqlite', {}).get('candidates', []))), flush=True)
           
           
