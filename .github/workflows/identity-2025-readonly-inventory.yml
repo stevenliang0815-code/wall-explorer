@@ -1,0 +1,163 @@
+name: 2025 Historical Identity Read-only Inventory
+"on":
+  push:
+    branches: [audit/identity-2025-readonly-20260911]
+    paths: [.github/workflows/identity-2025-readonly-inventory.yml]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: identity-2025-readonly-inventory
+  cancel-in-progress: false
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Install read client
+        run: python3 -m pip install --disable-pip-version-check boto3
+      - name: Verify official snapshot and inspect SQLite read-only
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME || secrets.R2_BUCKET }}
+        shell: python
+        run: |
+          """R2 GET/HEAD only; report aggregates, never retain the downloaded snapshot."""
+          import datetime
+          import gzip
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import sqlite3
+          import tempfile
+          
+          import boto3
+          from botocore.config import Config
+          
+          
+          def check(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+          
+          
+          def sha(path):
+              digest = hashlib.sha256()
+              with path.open('rb') as stream:
+                  for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+          
+          
+          def qi(name):
+              return '"' + name.replace('"', '""') + '"'
+          
+          
+          def audit(db):
+              c=sqlite3.connect(db.as_uri()+'?mode=ro&immutable=1',uri=True)
+              c.row_factory=sqlite3.Row
+              c.execute('PRAGMA query_only=ON')
+              def rows(q):return [dict(r) for r in c.execute(q)]
+              try:
+                  integrity=[r[0] for r in c.execute('PRAGMA integrity_check')]
+                  if integrity!=['ok']:raise RuntimeError('SQLite integrity failed')
+                  where="trading_date>='2025-01-01' AND trading_date<'2026-01-01' AND market IN ('TWSE','TPEX')"
+                  return {'integrityCheck':integrity,'scope_year':2025,
+                    'tables':{'historical_observations':{'rowCount':c.execute('SELECT count(*) FROM historical_observations').fetchone()[0]}},
+                    'candidates':rows('SELECT market,code,name,security_type,min(trading_date) AS observed_from,max(trading_date) AS observed_to,count(*) AS observations FROM historical_observations WHERE '+where+' GROUP BY market,code,name,security_type ORDER BY market,code,name,security_type'),
+                    'sources':rows('SELECT market,source,source_scope,min(trading_date) AS first_date,max(trading_date) AS last_date,count(*) AS observations FROM historical_observations WHERE '+where+' GROUP BY market,source,source_scope ORDER BY market,source,source_scope'),
+                    'daily_counts':rows('SELECT market,trading_date,count(*) AS observations FROM historical_observations WHERE '+where+' GROUP BY market,trading_date ORDER BY market,trading_date'),
+                    'qualification':'candidate_only; observation intervals are not listing validity; price/name continuity cannot prove permanent identity'}
+              finally:c.close()
+          
+          
+          def main():
+              output = Path('identity-inventory.json')
+              report = {'auditVersion': '1', 'observedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'allowedR2Operations': ['HeadObject', 'GetObject']}
+              temp = Path(tempfile.mkdtemp(prefix='r2-identity-2025-', dir=os.environ['RUNNER_TEMP'])).resolve()
+              client = boto3.client('s3', endpoint_url='https://' + os.environ['R2_ACCOUNT_ID'] + '.r2.cloudflarestorage.com',
+                                    aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'], aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
+                                    region_name='auto', config=Config(retries={'mode': 'standard', 'max_attempts': 4}))
+              def readonly(model, **kwargs):
+                  check(model.name in ('HeadObject', 'GetObject'), 'Forbidden R2 API operation')
+              client.meta.events.register('before-call.s3.*', readonly)
+              bucket = os.environ['R2_BUCKET']
+              def get(key):
+                  check(key.startswith('snapshots/historical/'), 'Unexpected object prefix')
+                  response = client.get_object(Bucket=bucket, Key=key)
+                  try:
+                      return response['Body'].read()
+                  finally:
+                      response['Body'].close()
+              try:
+                  pointer_bytes = get('snapshots/historical/latest.json')
+                  pointer = json.loads(pointer_bytes)
+                  check(pointer.get('status') == 'verified' and pointer.get('progress') == 100 and pointer.get('compression') == 'gzip-9-n', 'Pointer is not a verified official snapshot')
+                  key = pointer['objectKey']
+                  check(re.fullmatch(r'snapshots/historical/versions/builder-[a-f0-9]{64}\.sqlite\.gz', key), 'Invalid snapshot key')
+                  check(pointer['manifestKey'] == key + '.manifest.json', 'Unexpected manifest key')
+                  manifest = json.loads(get(pointer['manifestKey']))
+                  fields = ('version', 'objectKey', 'compressedBytes', 'compressedSha256', 'rawBytes', 'rawSha256', 'rows', 'lastDate', 'schemaVersion', 'progress', 'compression', 'manifestKey')
+                  for field in fields:
+                      check(pointer[field] == manifest[field], 'Pointer/manifest mismatch: ' + field)
+                  check(key.endswith('builder-' + pointer['rawSha256'] + '.sqlite.gz'), 'Key/raw hash mismatch')
+                  checksum = get(key + '.sha256').decode('ascii').strip().split()[0]
+                  check(checksum == pointer['compressedSha256'], 'Checksum sidecar mismatch')
+                  head = client.head_object(Bucket=bucket, Key=key)
+                  check(head['ContentLength'] == pointer['compressedBytes'], 'Head size mismatch')
+                  check(shutil.disk_usage(temp).free > pointer['compressedBytes'] + pointer['rawBytes'] + 1024**3, 'Insufficient temporary disk')
+                  report['snapshot'] = {field: pointer[field] for field in fields}
+                  report['snapshot']['etag'] = head['ETag']
+                  report['snapshot']['lastModified'] = head['LastModified'].isoformat()
+                  report['pointerSha256'] = hashlib.sha256(pointer_bytes).hexdigest()
+                  archive, db = temp / 'snapshot.sqlite.gz', temp / 'snapshot.sqlite'
+                  response = client.get_object(Bucket=bucket, Key=key, IfMatch=head['ETag'])
+                  try:
+                      with archive.open('wb') as stream:
+                          shutil.copyfileobj(response['Body'], stream, length=8*1024*1024)
+                  finally:
+                      response['Body'].close()
+                  check(archive.stat().st_size == pointer['compressedBytes'] and sha(archive) == checksum, 'Compressed checksum/size mismatch')
+                  with gzip.open(archive, 'rb') as source, db.open('wb') as target:
+                      shutil.copyfileobj(source, target, length=8*1024*1024)
+                  check(db.stat().st_size == pointer['rawBytes'] and sha(db) == pointer['rawSha256'], 'Raw checksum/size mismatch')
+                  print('SNAPSHOT_VERIFICATION=passed', flush=True)
+                  report['sqlite'] = audit(db)
+                  report['manifestRowCountMatches'] = report['sqlite']['tables']['historical_observations']['rowCount'] == pointer['rows']
+                  report['populationQualified'] = False
+                  report['pointerUnchangedAtEnd'] = get('snapshots/historical/latest.json') == pointer_bytes
+                  report['status'] = 'identity_candidates_extracted_not_qualified'
+              finally:
+                  # Only the freshly-created exact runner temp directory is deleted.
+                  check(temp.parent == Path(os.environ['RUNNER_TEMP']).resolve() and temp.name.startswith('r2-identity-2025-'), 'Unsafe cleanup path')
+                  shutil.rmtree(temp)
+                  report['temporarySnapshotDeleted'] = not temp.exists()
+                  output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+                  print('IDENTITY_CANDIDATES=' + str(len(report.get('sqlite', {}).get('candidates', []))), flush=True)
+          
+          
+          if __name__ == '__main__':
+              main()
+      - name: Ensure snapshot temporary files are removed
+        if: always()
+        shell: python
+        run: |
+          import os, pathlib, shutil
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve()
+          for candidate in root.glob("r2-identity-2025-*"):
+              assert candidate.resolve().parent == root and not candidate.is_symlink()
+              shutil.rmtree(candidate)
+          assert not list(root.glob("r2-identity-2025-*"))
+          print("SNAPSHOT_TEMP_CLEANUP=passed")
+      - name: Retain aggregate report only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r2-identity-2025-report
+          path: identity-inventory.json
+          if-no-files-found: error
+          retention-days: 7
